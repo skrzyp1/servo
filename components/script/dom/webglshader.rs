@@ -307,17 +307,17 @@ impl WebGLShader {
         // Replicating
         // https://github.com/servo/mozangle/blob/706a9baaf8026c1a3cb6c67ba63aa5f4734264d0/src/shaders/mod.rs#L226
         let options = options |
-	    mozangle::shaders::ffi::SH_VALIDATE |
-	    mozangle::shaders::ffi::SH_OBJECT_CODE |
-                      mozangle::shaders::ffi::SH_VARIABLES | // For uniform_name_map()
-                      mozangle::shaders::ffi::SH_EMULATE_ABS_INT_FUNCTION | // To workaround drivers
-                      mozangle::shaders::ffi::SH_EMULATE_ISNAN_FLOAT_FUNCTION | // To workaround drivers
-                      mozangle::shaders::ffi::SH_EMULATE_ATAN2_FLOAT_FUNCTION | // To workaround drivers
-                      mozangle::shaders::ffi::SH_CLAMP_INDIRECT_ARRAY_BOUNDS |
-                      mozangle::shaders::ffi::SH_INIT_GL_POSITION |
-                      mozangle::shaders::ffi::SH_ENFORCE_PACKING_RESTRICTIONS |
-                      mozangle::shaders::ffi::SH_LIMIT_EXPRESSION_COMPLEXITY |
-                      mozangle::shaders::ffi::SH_LIMIT_CALL_STACK_DEPTH;
+            mozangle::shaders::ffi::SH_VALIDATE |
+            mozangle::shaders::ffi::SH_OBJECT_CODE |
+            mozangle::shaders::ffi::SH_VARIABLES | // For uniform_name_map()
+            mozangle::shaders::ffi::SH_EMULATE_ABS_INT_FUNCTION | // To workaround drivers
+            mozangle::shaders::ffi::SH_EMULATE_ISNAN_FLOAT_FUNCTION | // To workaround drivers
+            mozangle::shaders::ffi::SH_EMULATE_ATAN2_FLOAT_FUNCTION | // To workaround drivers
+            mozangle::shaders::ffi::SH_CLAMP_INDIRECT_ARRAY_BOUNDS |
+            mozangle::shaders::ffi::SH_INIT_GL_POSITION |
+            mozangle::shaders::ffi::SH_ENFORCE_PACKING_RESTRICTIONS |
+            mozangle::shaders::ffi::SH_LIMIT_EXPRESSION_COMPLEXITY |
+            mozangle::shaders::ffi::SH_LIMIT_CALL_STACK_DEPTH;
 
         match validator.compile(&[&source], options) {
             Ok(()) => {
