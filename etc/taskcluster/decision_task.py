@@ -105,9 +105,6 @@ def mocked_only():
     windows_release()
     magicleap_dev()
     magicleap_nightly()
-    # FIXME: Reenable android testing once smup and surfmanup
-    # work with android.
-    android_nightly()
     decisionlib.DockerWorkerTask("Indexed by task definition").find_or_create()
 
 
