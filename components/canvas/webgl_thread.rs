@@ -49,7 +49,6 @@ use euclid::default::Size2D;
 use fnv::FnvHashMap;
 use half::f16;
 use pixels::{self, PixelFormat};
-use servo_config::opts;
 use sparkle::gl;
 use sparkle::gl::GLint;
 use sparkle::gl::GLuint;
@@ -2385,7 +2384,7 @@ impl WebGLImpl {
     // array object functions, but support a set of APPLE extension functions that
     // provide VAO support instead.
     fn needs_apple_vertex_arrays(gl_version: GLVersion) -> bool {
-        cfg!(target_os = "macos") && !opts::get().headless && gl_version.major < 3
+        cfg!(target_os = "macos") && gl_version.major < 3
     }
 
     #[allow(unsafe_code)]
