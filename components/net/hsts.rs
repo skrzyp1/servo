@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use embedder_traits::resources::{self, Resource};
 use headers::{Header, HeaderMapExt, HeaderName, HeaderValue};
 use http::HeaderMap;
@@ -57,6 +58,38 @@ impl HstsEntry {
     }
 }
 
+lazy_static! {
+    static ref AC: AhoCorasick = {
+        let preload_content = resources::read_string(Resource::HstsPreloadList);
+        debug!("Loading static hsts list with length: {}", preload_content.len());
+        let hsts_entries: HstsEntries = serde_json::from_str(&preload_content).unwrap();
+        let mut patterns: Vec<String> = Vec::with_capacity(hsts_entries.entries.len());
+        for hsts_entry in hsts_entries.entries {
+            let mut tmp: String = hsts_entry.host.chars().rev().collect();
+            tmp.shrink_to_fit();
+            assert_eq!(tmp.capacity(), tmp.len());
+            if hsts_entry.include_subdomains {
+                patterns.push(tmp);
+            } else {
+                patterns.push(tmp /*+ &"~"*/);
+            }
+
+        }
+        AhoCorasickBuilder::new().ascii_case_insensitive(true).auto_configure(&patterns).build(patterns)
+        //AhoCorasickBuilder::new().ascii_case_insensitive(true)
+        //.dfa(true)
+        //.premultiply(true)
+        //.byte_classes(true)
+        //.build_with_size(patterns).unwrap()
+        //.build(patterns)
+    };
+}
+
+#[derive(Deserialize)]
+struct HstsEntries {
+    entries: Vec<HstsEntry>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HstsList {
     pub entries_map: HashMap<String, Vec<HstsEntry>>,
@@ -71,11 +104,6 @@ impl HstsList {
 
     /// Create an `HstsList` from the bytes of a JSON preload file.
     pub fn from_preload(preload_content: &str) -> Option<HstsList> {
-        #[derive(Deserialize)]
-        struct HstsEntries {
-            entries: Vec<HstsEntry>,
-        }
-
         let hsts_entries: Option<HstsEntries> = serde_json::from_str(preload_content).ok();
 
         hsts_entries.map_or(None, |hsts_entries| {
@@ -90,6 +118,9 @@ impl HstsList {
     }
 
     pub fn from_servo_preload() -> HstsList {
+        let _ = AC.find("ved").unwrap();
+        return HstsList::new();
+
         let list = resources::read_string(Resource::HstsPreloadList);
         HstsList::from_preload(&list).expect("Servo HSTS preload file is invalid")
     }
