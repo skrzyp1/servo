@@ -12,7 +12,7 @@ use crate::dom::bindings::codegen::Bindings::TestBindingBinding::{
     TestBindingMethods, TestDictionary,
 };
 use crate::dom::bindings::codegen::Bindings::TestBindingBinding::{
-    TestDictionaryDefaults, TestEnum,
+    TestDictionaryDefaults, TestEnum, TestURLLike,
 };
 use crate::dom::bindings::codegen::UnionTypes;
 use crate::dom::bindings::codegen::UnionTypes::{
@@ -45,14 +45,15 @@ use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::bindings::weakref::MutableWeakRef;
 use crate::dom::blob::Blob;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::node::Node;
 use crate::dom::promise::Promise;
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
 use crate::dom::url::URL;
-use crate::realms::{AlreadyInRealm, InRealm};
+use crate::realms::InRealm;
 use crate::script_runtime::JSContext as SafeJSContext;
 use crate::timers::OneshotTimerCallback;
 use dom_struct::dom_struct;
-use js::jsapi::{Heap, JSContext, JSObject};
+use js::jsapi::{Heap, JSObject};
 use js::jsapi::{JS_NewPlainObject, JS_NewUint8ClampedArray};
 use js::jsval::{JSVal, NullValue};
 use js::rust::CustomAutoRooterGuard;
@@ -679,6 +680,14 @@ impl TestBindingMethods for TestBinding {
     fn PassOverloaded(&self, _: CustomAutoRooterGuard<typedarray::ArrayBuffer>) {}
     fn PassOverloaded_(&self, _: DOMString) {}
 
+    fn PassOverloadedDict(&self, _: &Node) -> DOMString {
+        "node".into()
+    }
+
+    fn PassOverloadedDict_(&self, u: &TestURLLike) -> DOMString {
+        u.href.clone()
+    }
+
     fn PassNullableBoolean(&self, _: Option<bool>) {}
     fn PassNullableByte(&self, _: Option<i8>) {}
     fn PassNullableOctet(&self, _: Option<u8>) {}
@@ -994,8 +1003,8 @@ impl TestBindingMethods for TestBinding {
             resolve.map(SimpleHandler::new),
             reject.map(SimpleHandler::new),
         );
-        let p = Promise::new_in_current_realm(&global, comp);
-        p.append_native_handler(&handler);
+        let p = Promise::new_in_current_realm(&global, comp.clone());
+        p.append_native_handler(&handler, comp);
         return p;
 
         #[derive(JSTraceable, MallocSizeOf)]
@@ -1009,12 +1018,8 @@ impl TestBindingMethods for TestBinding {
             }
         }
         impl Callback for SimpleHandler {
-            #[allow(unsafe_code)]
-            fn callback(&self, cx: *mut JSContext, v: HandleValue) {
-                let global = unsafe {
-                    let in_realm_proof = AlreadyInRealm::assert_for_cx(SafeJSContext::from_ptr(cx));
-                    GlobalScope::from_context(cx, InRealm::Already(&in_realm_proof))
-                };
+            fn callback(&self, cx: SafeJSContext, v: HandleValue, realm: InRealm) {
+                let global = GlobalScope::from_safe_context(cx, realm);
                 let _ = self.handler.Call_(&*global, v, ExceptionHandling::Report);
             }
         }
@@ -1048,8 +1053,8 @@ impl TestBindingMethods for TestBinding {
         }
     }
 
-    fn AdvanceClock(&self, ms: i32, tick: bool) {
-        self.global().as_window().advance_animation_clock(ms, tick);
+    fn AdvanceClock(&self, ms: i32) {
+        self.global().as_window().advance_animation_clock(ms);
     }
 
     fn Panic(&self) {

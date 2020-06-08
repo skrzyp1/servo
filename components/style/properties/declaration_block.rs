@@ -110,9 +110,17 @@ pub struct DeclarationImportanceIterator<'a> {
     iter: Zip<Iter<'a, PropertyDeclaration>, smallbitvec::Iter<'a>>,
 }
 
+impl<'a> Default for DeclarationImportanceIterator<'a> {
+    fn default() -> Self {
+        Self {
+            iter: [].iter().zip(smallbitvec::Iter::default()),
+        }
+    }
+}
+
 impl<'a> DeclarationImportanceIterator<'a> {
     /// Constructor.
-    pub fn new(declarations: &'a [PropertyDeclaration], important: &'a SmallBitVec) -> Self {
+    fn new(declarations: &'a [PropertyDeclaration], important: &'a SmallBitVec) -> Self {
         DeclarationImportanceIterator {
             iter: declarations.iter().zip(important.iter()),
         }
@@ -311,6 +319,13 @@ impl PropertyDeclarationBlock {
     #[inline]
     pub fn contains_any_reset(&self) -> bool {
         self.longhands.contains_any_reset()
+    }
+
+    /// Returns a `LonghandIdSet` representing the properties that are changed in
+    /// this block.
+    #[inline]
+    pub fn longhands(&self) -> &LonghandIdSet {
+        &self.longhands
     }
 
     /// Get a declaration for a given property.

@@ -11,7 +11,7 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
-use crate::dom::element::{AttributeMutation, Element, RawLayoutElementHelpers};
+use crate::dom::element::{AttributeMutation, Element, LayoutElementHelpers};
 use crate::dom::htmlcollection::{CollectionFilter, HTMLCollection};
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmltablecaptionelement::HTMLTableCaptionElement;
@@ -70,12 +70,15 @@ impl HTMLTableElement {
         prefix: Option<Prefix>,
         document: &Document,
     ) -> DomRoot<HTMLTableElement> {
-        Node::reflect_node(
+        let n = Node::reflect_node(
             Box::new(HTMLTableElement::new_inherited(
                 local_name, prefix, document,
             )),
             document,
-        )
+        );
+
+        n.upcast::<Node>().set_weird_parser_insertion_mode();
+        n
     }
 
     pub fn get_border(&self) -> Option<u32> {
@@ -406,42 +409,36 @@ impl HTMLTableElementMethods for HTMLTableElement {
 }
 
 pub trait HTMLTableElementLayoutHelpers {
-    fn get_background_color(&self) -> Option<RGBA>;
-    fn get_border(&self) -> Option<u32>;
-    fn get_cellspacing(&self) -> Option<u32>;
-    fn get_width(&self) -> LengthOrPercentageOrAuto;
+    fn get_background_color(self) -> Option<RGBA>;
+    fn get_border(self) -> Option<u32>;
+    fn get_cellspacing(self) -> Option<u32>;
+    fn get_width(self) -> LengthOrPercentageOrAuto;
 }
 
-impl HTMLTableElementLayoutHelpers for LayoutDom<HTMLTableElement> {
-    #[allow(unsafe_code)]
-    fn get_background_color(&self) -> Option<RGBA> {
-        unsafe {
-            (*self.upcast::<Element>().unsafe_get())
-                .get_attr_for_layout(&ns!(), &local_name!("bgcolor"))
-                .and_then(AttrValue::as_color)
-                .cloned()
-        }
+impl HTMLTableElementLayoutHelpers for LayoutDom<'_, HTMLTableElement> {
+    fn get_background_color(self) -> Option<RGBA> {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("bgcolor"))
+            .and_then(AttrValue::as_color)
+            .cloned()
     }
 
     #[allow(unsafe_code)]
-    fn get_border(&self) -> Option<u32> {
+    fn get_border(self) -> Option<u32> {
         unsafe { (*self.unsafe_get()).border.get() }
     }
 
     #[allow(unsafe_code)]
-    fn get_cellspacing(&self) -> Option<u32> {
+    fn get_cellspacing(self) -> Option<u32> {
         unsafe { (*self.unsafe_get()).cellspacing.get() }
     }
 
-    #[allow(unsafe_code)]
-    fn get_width(&self) -> LengthOrPercentageOrAuto {
-        unsafe {
-            (*self.upcast::<Element>().unsafe_get())
-                .get_attr_for_layout(&ns!(), &local_name!("width"))
-                .map(AttrValue::as_dimension)
-                .cloned()
-                .unwrap_or(LengthOrPercentageOrAuto::Auto)
-        }
+    fn get_width(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("width"))
+            .map(AttrValue::as_dimension)
+            .cloned()
+            .unwrap_or(LengthOrPercentageOrAuto::Auto)
     }
 }
 

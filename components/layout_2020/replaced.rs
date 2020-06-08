@@ -8,7 +8,7 @@ use crate::fragments::{DebugId, Fragment, ImageFragment};
 use crate::geom::flow_relative::{Rect, Vec2};
 use crate::geom::PhysicalSize;
 use crate::sizing::ContentSizes;
-use crate::style_ext::ComputedValuesExt;
+use crate::style_ext::{ComputedValuesExt, PaddingBorderMargin};
 use crate::ContainingBlock;
 use canvas_traits::canvas::{CanvasId, CanvasMsg, FromLayoutMsg};
 use ipc_channel::ipc::{self, IpcSender};
@@ -102,6 +102,7 @@ impl ReplacedContent {
 
         let width = (intrinsic_size_in_dots.width as CSSFloat) / dppx;
         let height = (intrinsic_size_in_dots.height as CSSFloat) / dppx;
+
         return Some(Self {
             kind,
             intrinsic: IntrinsicSizes {
@@ -124,7 +125,7 @@ impl ReplacedContent {
                 image_url.clone(),
                 UsePlaceholder::No,
             ) {
-                Some(ImageOrMetadataAvailable::ImageAvailable(image, _)) => {
+                Some(ImageOrMetadataAvailable::ImageAvailable { image, .. }) => {
                     (Some(image.clone()), image.width as f32, image.height as f32)
                 },
                 Some(ImageOrMetadataAvailable::MetadataAvailable(metadata)) => {
@@ -201,6 +202,12 @@ impl ReplacedContent {
                 .into_iter()
                 .collect(),
             ReplacedContentKind::Canvas(canvas_info) => {
+                if self.intrinsic.width == Some(Length::zero()) ||
+                    self.intrinsic.height == Some(Length::zero())
+                {
+                    return vec![];
+                }
+
                 let image_key = match canvas_info.source {
                     CanvasSource::WebGL(image_key) => image_key,
                     CanvasSource::Image(ref ipc_renderer) => match *ipc_renderer {
@@ -240,19 +247,17 @@ impl ReplacedContent {
         &self,
         containing_block: &ContainingBlock,
         style: &ComputedValues,
+        pbm: &PaddingBorderMargin,
     ) -> Vec2<Length> {
         let mode = style.writing_mode;
         let intrinsic_size = self.flow_relative_intrinsic_size(style);
         let intrinsic_ratio = self.inline_size_over_block_size_intrinsic_ratio(style);
 
-        let box_size = style.box_size().percentages_relative_to(containing_block);
+        let box_size = style.content_box_size(containing_block, &pbm);
+        let max_box_size = style.content_max_box_size(containing_block, &pbm);
         let min_box_size = style
-            .min_box_size()
-            .percentages_relative_to(containing_block)
+            .content_min_box_size(containing_block, &pbm)
             .auto_is(Length::zero);
-        let max_box_size = style
-            .max_box_size()
-            .percentages_relative_to(containing_block);
 
         let default_object_size = || {
             // FIXME:

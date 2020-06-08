@@ -22,11 +22,10 @@ use msg::constellation_msg::PipelineId;
 use script_layout_interface::rpc::TextIndexResponse;
 use script_layout_interface::rpc::{ContentBoxResponse, ContentBoxesResponse, LayoutRPC};
 use script_layout_interface::rpc::{NodeGeometryResponse, NodeScrollIdResponse};
-use script_layout_interface::rpc::{OffsetParentResponse, ResolvedStyleResponse, StyleResponse};
+use script_layout_interface::rpc::{OffsetParentResponse, ResolvedStyleResponse};
 use script_layout_interface::wrapper_traits::{
     LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
 };
-use script_layout_interface::StyleData;
 use script_layout_interface::{LayoutElementType, LayoutNodeType};
 use script_traits::LayoutMsg as ConstellationMsg;
 use script_traits::UntrustedNodeAddress;
@@ -76,9 +75,6 @@ pub struct LayoutThreadData {
 
     /// A queued response for the offset parent/rect of a node.
     pub offset_parent_response: OffsetParentResponse,
-
-    /// A queued response for the style of a node.
-    pub style_response: StyleResponse,
 
     /// Scroll offsets of scrolling regions.
     pub scroll_offsets: ScrollOffsetMap,
@@ -178,12 +174,6 @@ impl LayoutRPC for LayoutRPCImpl {
         let &LayoutRPCImpl(ref rw_data) = self;
         let rw_data = rw_data.lock().unwrap();
         rw_data.offset_parent_response.clone()
-    }
-
-    fn style(&self) -> StyleResponse {
-        let &LayoutRPCImpl(ref rw_data) = self;
-        let rw_data = rw_data.lock().unwrap();
-        rw_data.style_response.clone()
     }
 
     fn text_index(&self) -> TextIndexResponse {
@@ -688,9 +678,9 @@ pub fn process_client_rect_query(
     iterator.client_rect
 }
 
-pub fn process_node_scroll_id_request<N: LayoutNode>(
+pub fn process_node_scroll_id_request<'dom>(
     id: PipelineId,
-    requested_node: N,
+    requested_node: impl LayoutNode<'dom>,
 ) -> ExternalScrollId {
     let layout_node = requested_node.to_threadsafe();
     layout_node.generate_scroll_id(id)
@@ -747,16 +737,13 @@ pub fn process_node_scroll_area_request(
 
 /// Return the resolved value of property for a given (pseudo)element.
 /// <https://drafts.csswg.org/cssom/#resolved-value>
-pub fn process_resolved_style_request<'a, N>(
+pub fn process_resolved_style_request<'dom>(
     context: &LayoutContext,
-    node: N,
+    node: impl LayoutNode<'dom>,
     pseudo: &Option<PseudoElement>,
     property: &PropertyId,
     layout_root: &mut dyn Flow,
-) -> String
-where
-    N: LayoutNode,
-{
+) -> String {
     use style::stylist::RuleInclusion;
     use style::traversal::resolve_style;
 
@@ -764,7 +751,7 @@ where
 
     // We call process_resolved_style_request after performing a whole-document
     // traversal, so in the common case, the element is styled.
-    if element.get_data().is_some() {
+    if element.has_data() {
         return process_resolved_style_request_internal(node, pseudo, property, layout_root);
     }
 
@@ -797,15 +784,12 @@ where
 }
 
 /// The primary resolution logic, which assumes that the element is styled.
-fn process_resolved_style_request_internal<'a, N>(
-    requested_node: N,
+fn process_resolved_style_request_internal<'dom>(
+    requested_node: impl LayoutNode<'dom>,
     pseudo: &Option<PseudoElement>,
     property: &PropertyId,
     layout_root: &mut dyn Flow,
-) -> String
-where
-    N: LayoutNode,
-{
+) -> String {
     let layout_el = requested_node.to_threadsafe().as_element().unwrap();
     let layout_el = match *pseudo {
         Some(PseudoElement::Before) => layout_el.get_before_pseudo(),
@@ -851,12 +835,15 @@ where
     // There are probably other quirks.
     let applies = true;
 
-    fn used_value_for_position_property<N: LayoutNode>(
-        layout_el: <N::ConcreteThreadSafeLayoutNode as ThreadSafeLayoutNode>::ConcreteThreadSafeLayoutElement,
+    fn used_value_for_position_property<'dom, N>(
+        layout_el: <N::ConcreteThreadSafeLayoutNode as ThreadSafeLayoutNode<'dom>>::ConcreteThreadSafeLayoutElement,
         layout_root: &mut dyn Flow,
         requested_node: N,
         longhand_id: LonghandId,
-    ) -> String {
+    ) -> String
+    where
+        N: LayoutNode<'dom>,
+    {
         let maybe_data = layout_el.borrow_layout_data();
         let position = maybe_data.map_or(Point2D::zero(), |data| {
             match (*data).flow_construction_result {
@@ -969,21 +956,14 @@ pub fn process_offset_parent_query(
     }
 }
 
-pub fn process_style_query<N: LayoutNode>(requested_node: N) -> StyleResponse {
-    let element = requested_node.as_element().unwrap();
-    let data = element.borrow_data();
-
-    StyleResponse(data.map(|d| d.styles.primary().clone()))
-}
-
 enum InnerTextItem {
     Text(String),
     RequiredLineBreakCount(u32),
 }
 
 // https://html.spec.whatwg.org/multipage/#the-innertext-idl-attribute
-pub fn process_element_inner_text_query<N: LayoutNode>(
-    node: N,
+pub fn process_element_inner_text_query<'dom>(
+    node: impl LayoutNode<'dom>,
     indexable_text: &IndexableText,
 ) -> String {
     // Step 1.
@@ -1027,8 +1007,8 @@ pub fn process_element_inner_text_query<N: LayoutNode>(
 
 // https://html.spec.whatwg.org/multipage/#inner-text-collection-steps
 #[allow(unsafe_code)]
-fn inner_text_collection_steps<N: LayoutNode>(
-    node: N,
+fn inner_text_collection_steps<'dom>(
+    node: impl LayoutNode<'dom>,
     indexable_text: &IndexableText,
     results: &mut Vec<InnerTextItem>,
 ) {
@@ -1039,16 +1019,12 @@ fn inner_text_collection_steps<N: LayoutNode>(
             _ => child,
         };
 
-        let element_data = unsafe {
-            node.get_style_and_layout_data()
-                .map(|d| &(*(d.ptr.as_ptr() as *mut StyleData)).element_data)
+        let element_data = match node.get_style_and_opaque_layout_data() {
+            Some(data) => &data.style_data.element_data,
+            None => continue,
         };
 
-        if element_data.is_none() {
-            continue;
-        }
-
-        let style = match element_data.unwrap().borrow().styles.get_primary() {
+        let style = match element_data.borrow().styles.get_primary() {
             None => continue,
             Some(style) => style.clone(),
         };

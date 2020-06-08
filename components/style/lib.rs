@@ -32,8 +32,6 @@ extern crate atomic_refcell;
 extern crate bitflags;
 #[allow(unused_extern_crates)]
 extern crate byteorder;
-#[cfg(feature = "servo")]
-extern crate crossbeam_channel;
 #[macro_use]
 extern crate cssparser;
 #[macro_use]
@@ -159,7 +157,6 @@ pub mod stylesheet_set;
 pub mod stylesheets;
 pub mod stylist;
 pub mod thread_state;
-pub mod timer;
 pub mod traversal;
 pub mod traversal_flags;
 pub mod use_counters;
@@ -273,5 +270,28 @@ where
 
     fn is_zero(&self) -> bool {
         <Self as num_traits::Zero>::is_zero(self)
+    }
+}
+
+/// A trait pretty much similar to num_traits::One, but without the need of
+/// implementing `Mul`.
+pub trait One {
+    /// Reutrns the one value.
+    fn one() -> Self;
+
+    /// Returns whether this value is one.
+    fn is_one(&self) -> bool;
+}
+
+impl<T> One for T
+where
+    T: num_traits::One + PartialEq,
+{
+    fn one() -> Self {
+        <Self as num_traits::One>::one()
+    }
+
+    fn is_one(&self) -> bool {
+        *self == One::one()
     }
 }

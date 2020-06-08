@@ -12,12 +12,16 @@ use crate::context::{ElementCascadeInputs, QuirksMode, SelectorFlagsMap};
 use crate::context::{SharedStyleContext, StyleContext};
 use crate::data::ElementData;
 use crate::dom::TElement;
+#[cfg(feature = "servo")]
+use crate::dom::TNode;
 use crate::invalidation::element::restyle_hints::RestyleHint;
 use crate::properties::longhands::display::computed_value::T as Display;
 use crate::properties::ComputedValues;
 use crate::rule_tree::{CascadeLevel, StrongRuleNode};
 use crate::selector_parser::{PseudoElement, RestyleDamage};
 use crate::style_resolver::ResolvedElementStyles;
+use crate::style_resolver::{PseudoElementResolution, StyleResolverForElement};
+use crate::stylist::RuleInclusion;
 use crate::traversal_flags::TraversalFlags;
 use selectors::matching::ElementSelectorFlags;
 use servo_arc::{Arc, ArcBorrow};
@@ -197,8 +201,6 @@ trait PrivateMatchMethods: TElement {
         primary_style: &Arc<ComputedValues>,
     ) -> Option<Arc<ComputedValues>> {
         use crate::context::CascadeInputs;
-        use crate::style_resolver::{PseudoElementResolution, StyleResolverForElement};
-        use crate::stylist::RuleInclusion;
 
         let rule_node = primary_style.rules();
         let without_transition_rules = context
@@ -231,7 +233,6 @@ trait PrivateMatchMethods: TElement {
         Some(style.0)
     }
 
-    #[cfg(feature = "gecko")]
     fn needs_animations_update(
         &self,
         context: &mut StyleContext<Self>,
@@ -241,7 +242,7 @@ trait PrivateMatchMethods: TElement {
         let new_box_style = new_style.get_box();
         let new_style_specifies_animations = new_box_style.specifies_animations();
 
-        let has_animations = self.has_css_animations();
+        let has_animations = self.has_css_animations(&context.shared);
         if !new_style_specifies_animations && !has_animations {
             return false;
         }
@@ -435,43 +436,62 @@ trait PrivateMatchMethods: TElement {
         _restyle_hint: RestyleHint,
         _important_rules_changed: bool,
     ) {
-        use crate::animation;
-        use crate::dom::TNode;
+        use crate::animation::AnimationState;
 
-        let mut possibly_expired_animations = vec![];
+        // We need to call this before accessing the `ElementAnimationSet` from the
+        // map because this call will do a RwLock::read().
+        let needs_animations_update =
+            self.needs_animations_update(context, old_values.as_ref().map(|s| &**s), new_values);
+
+        let this_opaque = self.as_node().opaque();
         let shared_context = context.shared;
-        if let Some(ref mut old) = *old_values {
-            // FIXME(emilio, #20116): This makes no sense.
-            self.update_animations_for_cascade(
-                shared_context,
-                old,
-                &mut possibly_expired_animations,
-                &context.thread_local.font_metrics_provider,
+        let mut animation_set = shared_context
+            .animation_states
+            .write()
+            .remove(&this_opaque)
+            .unwrap_or_default();
+
+        // Starting animations is expensive, because we have to recalculate the style
+        // for all the keyframes. We only want to do this if we think that there's a
+        // chance that the animations really changed.
+        if needs_animations_update {
+            let mut resolver = StyleResolverForElement::new(
+                *self,
+                context,
+                RuleInclusion::All,
+                PseudoElementResolution::IfApplicable,
+            );
+
+            animation_set.update_animations_for_new_style::<Self>(
+                *self,
+                &shared_context,
+                &new_values,
+                &mut resolver,
             );
         }
 
-        let new_animations_sender = &context.thread_local.new_animations_sender;
-        let this_opaque = self.as_node().opaque();
-        // Trigger any present animations if necessary.
-        animation::maybe_start_animations(
-            *self,
+        animation_set.update_transitions_for_new_style(
             &shared_context,
-            new_animations_sender,
             this_opaque,
-            &new_values,
+            old_values.as_ref(),
+            new_values,
         );
 
-        // Trigger transitions if necessary. This will reset `new_values` back
-        // to its old value if it did trigger a transition.
-        if let Some(ref values) = *old_values {
-            animation::start_transitions_if_applicable(
-                new_animations_sender,
-                this_opaque,
-                &values,
-                new_values,
-                &shared_context.timer,
-                &possibly_expired_animations,
-            );
+        animation_set.apply_active_animations(shared_context, new_values);
+
+        // We clear away any finished transitions, but retain animations, because they
+        // might still be used for proper calculation of `animation-fill-mode`.
+        animation_set
+            .transitions
+            .retain(|transition| transition.state != AnimationState::Finished);
+
+        // If the ElementAnimationSet is empty, and don't store it in order to
+        // save memory and to avoid extra processing later.
+        if !animation_set.is_empty() {
+            shared_context
+                .animation_states
+                .write()
+                .insert(this_opaque, animation_set);
         }
     }
 
@@ -586,63 +606,6 @@ trait PrivateMatchMethods: TElement {
         // We could prove that, if our children don't inherit reset
         // properties, we can stop the cascade.
         ChildCascadeRequirement::MustCascadeChildrenIfInheritResetStyle
-    }
-
-    // FIXME(emilio, #20116): It's not clear to me that the name of this method
-    // represents anything of what it does.
-    //
-    // Also, this function gets the old style, for some reason I don't really
-    // get, but the functions called (mainly update_style_for_animation) expects
-    // the new style, wtf?
-    #[cfg(feature = "servo")]
-    fn update_animations_for_cascade(
-        &self,
-        context: &SharedStyleContext,
-        style: &mut Arc<ComputedValues>,
-        possibly_expired_animations: &mut Vec<crate::animation::PropertyAnimation>,
-        font_metrics: &dyn crate::font_metrics::FontMetricsProvider,
-    ) {
-        use crate::animation::{self, Animation, AnimationUpdate};
-        use crate::dom::TNode;
-
-        // Finish any expired transitions.
-        let this_opaque = self.as_node().opaque();
-        animation::complete_expired_transitions(this_opaque, style, context);
-
-        // Merge any running animations into the current style, and cancel them.
-        let had_running_animations = context
-            .running_animations
-            .read()
-            .get(&this_opaque)
-            .is_some();
-        if !had_running_animations {
-            return;
-        }
-
-        let mut all_running_animations = context.running_animations.write();
-        for mut running_animation in all_running_animations.get_mut(&this_opaque).unwrap() {
-            if let Animation::Transition(_, _, ref frame) = *running_animation {
-                possibly_expired_animations.push(frame.property_animation.clone());
-                continue;
-            }
-
-            let update = animation::update_style_for_animation::<Self>(
-                context,
-                &mut running_animation,
-                style,
-                font_metrics,
-            );
-
-            match *running_animation {
-                Animation::Transition(..) => unreachable!(),
-                Animation::Keyframes(_, _, _, ref mut state) => match update {
-                    AnimationUpdate::Regular => {},
-                    AnimationUpdate::AnimationCanceled => {
-                        state.expired = true;
-                    },
-                },
-            }
-        }
     }
 }
 

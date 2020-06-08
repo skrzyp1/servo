@@ -10,6 +10,7 @@
 from __future__ import print_function, unicode_literals
 
 import datetime
+import locale
 import os
 import os.path as path
 import platform
@@ -255,10 +256,11 @@ class MachCommands(CommandBase):
             vs_dirs = self.vs_dirs()
 
         if host != target_triple and 'windows' in target_triple:
-            if os.environ.get('VisualStudioVersion'):
+            if os.environ.get('VisualStudioVersion') or os.environ.get('VCINSTALLDIR'):
                 print("Can't cross-compile for Windows inside of a Visual Studio shell.\n"
                       "Please run `python mach build [arguments]` to bypass automatic "
-                      "Visual Studio shell.")
+                      "Visual Studio shell, and make sure the VisualStudioVersion and "
+                      "VCINSTALLDIR environment variables are not set.")
                 sys.exit(1)
             vcinstalldir = vs_dirs['vcdir']
             if not os.path.exists(vcinstalldir):
@@ -309,6 +311,20 @@ class MachCommands(CommandBase):
                 self.msvc_package_dir("gstreamer-uwp"), arch['gst_root'],
                 "lib", "pkgconfig"
             )
+
+        if 'windows' in host:
+            process = subprocess.Popen('("%s" %s > nul) && "python" -c "import os; print(repr(os.environ))"' %
+                                       (os.path.join(vs_dirs['vcdir'], "Auxiliary", "Build", "vcvarsall.bat"), "x64"),
+                                       stdout=subprocess.PIPE, shell=True)
+            stdout, stderr = process.communicate()
+            exitcode = process.wait()
+            encoding = locale.getpreferredencoding()  # See https://stackoverflow.com/a/9228117
+            if exitcode == 0:
+                os.environ.update(eval(stdout.decode(encoding)))
+            else:
+                print("Failed to run vcvarsall. stderr:")
+                print(stderr.decode(encoding))
+                exit(1)
 
         # Ensure that GStreamer libraries are accessible when linking.
         if 'windows' in target_triple:
@@ -755,6 +771,18 @@ class MachCommands(CommandBase):
             print('Removing virtualenv directory: %s' % virtualenv_path)
             shutil.rmtree(virtualenv_path)
 
+        self.clean_uwp()
+
+        opts = ["--manifest-path", manifest_path or path.join(self.context.topdir, "Cargo.toml")]
+        if verbose:
+            opts += ["-v"]
+        opts += params
+        return check_call(["cargo", "clean"] + opts, env=self.build_env(), verbose=verbose)
+
+    @Command('clean-uwp',
+             description='Clean the support/hololens/ directory.',
+             category='build')
+    def clean_uwp(self):
         uwp_artifacts = [
             "support/hololens/x64/",
             "support/hololens/ARM/",
@@ -769,18 +797,16 @@ class MachCommands(CommandBase):
             "support/hololens/ServoApp/Release/",
             "support/hololens/packages/",
             "support/hololens/AppPackages/",
+            "support/hololens/ServoApp/ServoApp.vcxproj.user",
         ]
 
         for uwp_artifact in uwp_artifacts:
-            dir_path = path.join(self.get_top_dir(), uwp_artifact)
-            if path.exists(dir_path):
-                shutil.rmtree(dir_path)
-
-        opts = ["--manifest-path", manifest_path or path.join(self.context.topdir, "Cargo.toml")]
-        if verbose:
-            opts += ["-v"]
-        opts += params
-        return check_call(["cargo", "clean"] + opts, env=self.build_env(), verbose=verbose)
+            artifact = path.join(self.get_top_dir(), uwp_artifact)
+            if path.exists(artifact):
+                if path.isdir(artifact):
+                    shutil.rmtree(artifact)
+                else:
+                    os.remove(artifact)
 
 
 def angle_root(target, nuget_env):

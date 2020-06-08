@@ -2,16 +2,23 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::geom::{flow_relative, PhysicalSides, PhysicalSize};
+use crate::geom::flow_relative;
+use crate::geom::{LengthOrAuto, LengthPercentageOrAuto, PhysicalSides, PhysicalSize};
+use crate::ContainingBlock;
 use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
 use style::computed_values::position::T as ComputedPosition;
 use style::computed_values::transform_style::T as ComputedTransformStyle;
+use style::properties::longhands::backface_visibility::computed_value::T as BackfaceVisiblity;
+use style::properties::longhands::box_sizing::computed_value::T as BoxSizing;
 use style::properties::ComputedValues;
-use style::values::computed::{Length, LengthPercentage, LengthPercentageOrAuto};
+use style::values::computed::image::Image as ComputedImageLayer;
+use style::values::computed::{Length, LengthPercentage};
 use style::values::computed::{NonNegativeLengthPercentage, Size};
 use style::values::generics::box_::Perspective;
 use style::values::generics::length::MaxSize;
 use style::values::specified::box_ as stylo;
+use style::Zero;
+use webrender_api as wr;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Display {
@@ -41,6 +48,17 @@ pub(crate) enum DisplayOutside {
 pub(crate) enum DisplayInside {
     Flow,
     FlowRoot,
+    Flex,
+}
+
+/// Percentages resolved but not `auto` margins
+pub(crate) struct PaddingBorderMargin {
+    pub padding: flow_relative::Sides<Length>,
+    pub border: flow_relative::Sides<Length>,
+    pub margin: flow_relative::Sides<LengthOrAuto>,
+
+    /// Pre-computed sums in each axis
+    pub padding_border_sums: flow_relative::Vec2<Length>,
 }
 
 pub(crate) trait ComputedValuesExt {
@@ -49,8 +67,24 @@ pub(crate) trait ComputedValuesExt {
     fn box_offsets(&self) -> flow_relative::Sides<LengthPercentageOrAuto>;
     fn box_size(&self) -> flow_relative::Vec2<LengthPercentageOrAuto>;
     fn min_box_size(&self) -> flow_relative::Vec2<LengthPercentageOrAuto>;
-    fn max_box_size(&self) -> flow_relative::Vec2<MaxSize<LengthPercentage>>;
-    fn padding(&self) -> flow_relative::Sides<LengthPercentage>;
+    fn max_box_size(&self) -> flow_relative::Vec2<Option<&LengthPercentage>>;
+    fn content_box_size(
+        &self,
+        containing_block: &ContainingBlock,
+        pbm: &PaddingBorderMargin,
+    ) -> flow_relative::Vec2<LengthOrAuto>;
+    fn content_min_box_size(
+        &self,
+        containing_block: &ContainingBlock,
+        pbm: &PaddingBorderMargin,
+    ) -> flow_relative::Vec2<LengthOrAuto>;
+    fn content_max_box_size(
+        &self,
+        containing_block: &ContainingBlock,
+        pbm: &PaddingBorderMargin,
+    ) -> flow_relative::Vec2<Option<Length>>;
+    fn padding_border_margin(&self, containing_block: &ContainingBlock) -> PaddingBorderMargin;
+    fn padding(&self) -> flow_relative::Sides<&LengthPercentage>;
     fn border_width(&self) -> flow_relative::Sides<Length>;
     fn margin(&self) -> flow_relative::Sides<LengthPercentageOrAuto>;
     fn has_transform_or_perspective(&self) -> bool;
@@ -58,6 +92,8 @@ pub(crate) trait ComputedValuesExt {
     fn establishes_stacking_context(&self) -> bool;
     fn establishes_containing_block(&self) -> bool;
     fn establishes_containing_block_for_all_descendants(&self) -> bool;
+    fn background_is_transparent(&self) -> bool;
+    fn get_webrender_primitive_flags(&self) -> wr::PrimitiveFlags;
 }
 
 impl ComputedValuesExt for ComputedValues {
@@ -81,69 +117,142 @@ impl ComputedValuesExt for ComputedValues {
         !a.is_auto() && !b.is_auto()
     }
 
-    #[inline]
     fn box_offsets(&self) -> flow_relative::Sides<LengthPercentageOrAuto> {
         let position = self.get_position();
         flow_relative::Sides::from_physical(
             &PhysicalSides::new(
-                position.top.clone(),
-                position.right.clone(),
-                position.bottom.clone(),
-                position.left.clone(),
+                position.top.as_ref(),
+                position.right.as_ref(),
+                position.bottom.as_ref(),
+                position.left.as_ref(),
             ),
             self.writing_mode,
         )
     }
 
-    #[inline]
     fn box_size(&self) -> flow_relative::Vec2<LengthPercentageOrAuto> {
         let position = self.get_position();
         flow_relative::Vec2::from_physical_size(
             &PhysicalSize::new(
-                size_to_length(position.width.clone()),
-                size_to_length(position.height.clone()),
+                size_to_length(&position.width),
+                size_to_length(&position.height),
             ),
             self.writing_mode,
         )
     }
 
-    #[inline]
     fn min_box_size(&self) -> flow_relative::Vec2<LengthPercentageOrAuto> {
         let position = self.get_position();
         flow_relative::Vec2::from_physical_size(
             &PhysicalSize::new(
-                size_to_length(position.min_width.clone()),
-                size_to_length(position.min_height.clone()),
+                size_to_length(&position.min_width),
+                size_to_length(&position.min_height),
             ),
             self.writing_mode,
         )
     }
 
-    #[inline]
-    fn max_box_size(&self) -> flow_relative::Vec2<MaxSize<LengthPercentage>> {
-        let unwrap = |max_size: MaxSize<NonNegativeLengthPercentage>| match max_size {
-            MaxSize::LengthPercentage(length) => MaxSize::LengthPercentage(length.0),
-            MaxSize::None => MaxSize::None,
-        };
+    fn max_box_size(&self) -> flow_relative::Vec2<Option<&LengthPercentage>> {
+        fn unwrap(max_size: &MaxSize<NonNegativeLengthPercentage>) -> Option<&LengthPercentage> {
+            match max_size {
+                MaxSize::LengthPercentage(length) => Some(&length.0),
+                MaxSize::None => None,
+            }
+        }
         let position = self.get_position();
         flow_relative::Vec2::from_physical_size(
-            &PhysicalSize::new(
-                unwrap(position.max_width.clone()),
-                unwrap(position.max_height.clone()),
-            ),
+            &PhysicalSize::new(unwrap(&position.max_width), unwrap(&position.max_height)),
             self.writing_mode,
         )
     }
 
-    #[inline]
-    fn padding(&self) -> flow_relative::Sides<LengthPercentage> {
+    fn content_box_size(
+        &self,
+        containing_block: &ContainingBlock,
+        pbm: &PaddingBorderMargin,
+    ) -> flow_relative::Vec2<LengthOrAuto> {
+        let box_size = self.box_size().percentages_relative_to(containing_block);
+        match self.get_position().box_sizing {
+            BoxSizing::ContentBox => box_size,
+            BoxSizing::BorderBox => flow_relative::Vec2 {
+                // These may be negative, but will later be clamped by `min-width`/`min-height`
+                // which is clamped to zero.
+                inline: box_size.inline.map(|i| i - pbm.padding_border_sums.inline),
+                block: box_size.block.map(|b| b - pbm.padding_border_sums.block),
+            },
+        }
+    }
+
+    fn content_min_box_size(
+        &self,
+        containing_block: &ContainingBlock,
+        pbm: &PaddingBorderMargin,
+    ) -> flow_relative::Vec2<LengthOrAuto> {
+        let min_box_size = self
+            .min_box_size()
+            .percentages_relative_to(containing_block);
+        match self.get_position().box_sizing {
+            BoxSizing::ContentBox => min_box_size,
+            BoxSizing::BorderBox => flow_relative::Vec2 {
+                // Clamp to zero to make sure the used size components are non-negative
+                inline: min_box_size
+                    .inline
+                    .map(|i| (i - pbm.padding_border_sums.inline).max(Length::zero())),
+                block: min_box_size
+                    .block
+                    .map(|b| (b - pbm.padding_border_sums.block).max(Length::zero())),
+            },
+        }
+    }
+
+    fn content_max_box_size(
+        &self,
+        containing_block: &ContainingBlock,
+        pbm: &PaddingBorderMargin,
+    ) -> flow_relative::Vec2<Option<Length>> {
+        let max_box_size = self
+            .max_box_size()
+            .percentages_relative_to(containing_block);
+        match self.get_position().box_sizing {
+            BoxSizing::ContentBox => max_box_size,
+            BoxSizing::BorderBox => {
+                // This may be negative, but will later be clamped by `min-width`
+                // which itself is clamped to zero.
+                flow_relative::Vec2 {
+                    inline: max_box_size
+                        .inline
+                        .map(|i| i - pbm.padding_border_sums.inline),
+                    block: max_box_size
+                        .block
+                        .map(|b| b - pbm.padding_border_sums.block),
+                }
+            },
+        }
+    }
+
+    fn padding_border_margin(&self, containing_block: &ContainingBlock) -> PaddingBorderMargin {
+        let cbis = containing_block.inline_size;
+        let padding = self.padding().percentages_relative_to(cbis);
+        let border = self.border_width();
+        PaddingBorderMargin {
+            padding_border_sums: flow_relative::Vec2 {
+                inline: padding.inline_sum() + border.inline_sum(),
+                block: padding.block_sum() + border.block_sum(),
+            },
+            padding,
+            border,
+            margin: self.margin().percentages_relative_to(cbis),
+        }
+    }
+
+    fn padding(&self) -> flow_relative::Sides<&LengthPercentage> {
         let padding = self.get_padding();
         flow_relative::Sides::from_physical(
             &PhysicalSides::new(
-                padding.padding_top.0.clone(),
-                padding.padding_right.0.clone(),
-                padding.padding_bottom.0.clone(),
-                padding.padding_left.0.clone(),
+                &padding.padding_top.0,
+                &padding.padding_right.0,
+                &padding.padding_bottom.0,
+                &padding.padding_left.0,
             ),
             self.writing_mode,
         )
@@ -166,10 +275,10 @@ impl ComputedValuesExt for ComputedValues {
         let margin = self.get_margin();
         flow_relative::Sides::from_physical(
             &PhysicalSides::new(
-                margin.margin_top.clone(),
-                margin.margin_right.clone(),
-                margin.margin_bottom.clone(),
-                margin.margin_left.clone(),
+                margin.margin_top.as_ref(),
+                margin.margin_right.as_ref(),
+                margin.margin_bottom.as_ref(),
+                margin.margin_left.as_ref(),
             ),
             self.writing_mode,
         )
@@ -258,6 +367,27 @@ impl ComputedValuesExt for ComputedValues {
         // TODO: We need to handle CSS Contain here.
         false
     }
+
+    /// Whether or not this style specifies a non-transparent background.
+    fn background_is_transparent(&self) -> bool {
+        let background = self.get_background();
+        let color = self.resolve_color(background.background_color);
+        color.alpha == 0 &&
+            background
+                .background_image
+                .0
+                .iter()
+                .all(|layer| matches!(layer, ComputedImageLayer::None))
+    }
+
+    /// Generate appropriate WebRender `PrimitiveFlags` that should be used
+    /// for display items generated by the `Fragment` which owns this style.
+    fn get_webrender_primitive_flags(&self) -> wr::PrimitiveFlags {
+        match self.get_box().backface_visibility {
+            BackfaceVisiblity::Visible => wr::PrimitiveFlags::default(),
+            BackfaceVisiblity::Hidden => wr::PrimitiveFlags::empty(),
+        }
+    }
 }
 
 impl From<stylo::Display> for Display {
@@ -265,6 +395,7 @@ impl From<stylo::Display> for Display {
         let inside = match packed.inside() {
             stylo::DisplayInside::Flow => DisplayInside::Flow,
             stylo::DisplayInside::FlowRoot => DisplayInside::FlowRoot,
+            stylo::DisplayInside::Flex => DisplayInside::Flex,
 
             // These should not be values of DisplayInside, but oh well
             stylo::DisplayInside::None => return Display::None,
@@ -285,11 +416,9 @@ impl From<stylo::Display> for Display {
     }
 }
 
-fn size_to_length(size: Size) -> LengthPercentageOrAuto {
+fn size_to_length(size: &Size) -> LengthPercentageOrAuto {
     match size {
-        Size::LengthPercentage(length) => {
-            LengthPercentageOrAuto::LengthPercentage(length.0.clone())
-        },
+        Size::LengthPercentage(length) => LengthPercentageOrAuto::LengthPercentage(&length.0),
         Size::Auto => LengthPercentageOrAuto::Auto,
     }
 }

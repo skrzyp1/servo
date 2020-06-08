@@ -8,9 +8,13 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::xrhittestresult::XRHitTestResult;
+use crate::dom::xrhittestsource::XRHitTestSource;
+use crate::dom::xrjointpose::XRJointPose;
+use crate::dom::xrjointspace::XRJointSpace;
 use crate::dom::xrpose::XRPose;
 use crate::dom::xrreferencespace::XRReferenceSpace;
-use crate::dom::xrsession::XRSession;
+use crate::dom::xrsession::{ApiPose, XRSession};
 use crate::dom::xrspace::XRSpace;
 use crate::dom::xrviewerpose::XRViewerPose;
 use dom_struct::dom_struct;
@@ -21,7 +25,7 @@ use webxr_api::Frame;
 pub struct XRFrame {
     reflector_: Reflector,
     session: Dom<XRSession>,
-    #[ignore_malloc_size_of = "defined in rust-webvr"]
+    #[ignore_malloc_size_of = "defined in webxr_api"]
     data: Frame,
     active: Cell<bool>,
     animation_frame: Cell<bool>,
@@ -51,6 +55,10 @@ impl XRFrame {
     pub fn set_animation_frame(&self, animation_frame: bool) {
         self.animation_frame.set(animation_frame);
     }
+
+    pub fn get_pose(&self, space: &XRSpace) -> Option<ApiPose> {
+        space.get_pose(&self.data)
+    }
 }
 
 impl XRFrameMethods for XRFrame {
@@ -72,12 +80,22 @@ impl XRFrameMethods for XRFrame {
             return Err(Error::InvalidState);
         }
 
-        let pose = if let Some(pose) = reference.get_viewer_pose(&self.data) {
+        let to_base = if let Some(to_base) = reference.get_base_transform(&self.data) {
+            to_base
+        } else {
+            return Ok(None);
+        };
+        let viewer_pose = if let Some(pose) = self.data.pose.as_ref() {
             pose
         } else {
             return Ok(None);
         };
-        Ok(Some(XRViewerPose::new(&self.global(), &self.session, pose)))
+        Ok(Some(XRViewerPose::new(
+            &self.global(),
+            &self.session,
+            to_base,
+            viewer_pose,
+        )))
     }
 
     /// https://immersive-web.github.io/webxr/#dom-xrframe-getpose
@@ -92,17 +110,59 @@ impl XRFrameMethods for XRFrame {
         if !self.active.get() {
             return Err(Error::InvalidState);
         }
-        let space = if let Some(space) = space.get_pose(&self.data) {
+        let space = if let Some(space) = self.get_pose(space) {
             space
         } else {
             return Ok(None);
         };
-        let relative_to = if let Some(r) = relative_to.get_pose(&self.data) {
+        let relative_to = if let Some(r) = self.get_pose(relative_to) {
             r
         } else {
             return Ok(None);
         };
         let pose = relative_to.inverse().pre_transform(&space);
         Ok(Some(XRPose::new(&self.global(), pose)))
+    }
+
+    /// https://immersive-web.github.io/webxr/#dom-xrframe-getpose
+    fn GetJointPose(
+        &self,
+        space: &XRJointSpace,
+        relative_to: &XRSpace,
+    ) -> Result<Option<DomRoot<XRJointPose>>, Error> {
+        if self.session != space.upcast::<XRSpace>().session() ||
+            self.session != relative_to.session()
+        {
+            return Err(Error::InvalidState);
+        }
+        if !self.active.get() {
+            return Err(Error::InvalidState);
+        }
+        let joint_frame = if let Some(frame) = space.frame(&self.data) {
+            frame
+        } else {
+            return Ok(None);
+        };
+        let relative_to = if let Some(r) = self.get_pose(relative_to) {
+            r
+        } else {
+            return Ok(None);
+        };
+        let pose = relative_to.inverse().pre_transform(&joint_frame.pose);
+        Ok(Some(XRJointPose::new(
+            &self.global(),
+            pose.cast_unit(),
+            Some(joint_frame.radius),
+        )))
+    }
+
+    /// https://immersive-web.github.io/hit-test/#dom-xrframe-gethittestresults
+    fn GetHitTestResults(&self, source: &XRHitTestSource) -> Vec<DomRoot<XRHitTestResult>> {
+        self.data
+            .hit_test_results
+            .iter()
+            .filter(|r| r.id == source.id())
+            .map(|r| XRHitTestResult::new(&self.global(), *r, self))
+            .collect()
     }
 }

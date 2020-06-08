@@ -39,7 +39,7 @@ use profile_traits::mem::{Report, ReportKind, ReportsChan};
 use profile_traits::time::ProfilerChan;
 use serde::{Deserialize, Serialize};
 use servo_arc::Arc as ServoArc;
-use servo_url::ServoUrl;
+use servo_url::{ImmutableOrigin, ServoUrl};
 use std::borrow::{Cow, ToOwned};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -152,7 +152,7 @@ fn create_http_states(
         http_cache_state: Mutex::new(HashMap::new()),
         client: create_http_client(
             create_tls_config(&certs, ALPN_H2_H1),
-            HANDLE.lock().unwrap().executor(),
+            HANDLE.lock().unwrap().as_ref().unwrap().executor(),
         ),
     };
 
@@ -165,7 +165,7 @@ fn create_http_states(
         http_cache_state: Mutex::new(HashMap::new()),
         client: create_http_client(
             create_tls_config(&certs, ALPN_H2_H1),
-            HANDLE.lock().unwrap().executor(),
+            HANDLE.lock().unwrap().as_ref().unwrap().executor(),
         ),
     };
 
@@ -299,8 +299,10 @@ impl ResourceChannelManager {
                     .send(cookie_jar.cookies_for_url(&url, source))
                     .unwrap();
             },
-            CoreResourceMsg::NetworkMediator(mediator_chan) => {
-                self.resource_manager.swmanager_chan = Some(mediator_chan)
+            CoreResourceMsg::NetworkMediator(mediator_chan, origin) => {
+                self.resource_manager
+                    .sw_managers
+                    .insert(origin, mediator_chan);
             },
             CoreResourceMsg::GetCookiesDataForUrl(url, consumer, source) => {
                 let mut cookie_jar = http_state.cookie_jar.write().unwrap();
@@ -431,7 +433,7 @@ pub struct AuthCache {
 pub struct CoreResourceManager {
     user_agent: Cow<'static, str>,
     devtools_chan: Option<Sender<DevtoolsControlMsg>>,
-    swmanager_chan: Option<IpcSender<CustomResponseMediator>>,
+    sw_managers: HashMap<ImmutableOrigin, IpcSender<CustomResponseMediator>>,
     filemanager: FileManager,
     thread_pool: Arc<CoreResourceThreadPool>,
     certificate_path: Option<String>,
@@ -575,7 +577,7 @@ impl CoreResourceManager {
         CoreResourceManager {
             user_agent: user_agent,
             devtools_chan: devtools_channel,
-            swmanager_chan: None,
+            sw_managers: Default::default(),
             filemanager: FileManager::new(embedder_proxy, Arc::downgrade(&pool_handle)),
             thread_pool: pool_handle,
             certificate_path,
@@ -588,6 +590,9 @@ impl CoreResourceManager {
         // blocks until all workers in the pool are done,
         // or a short timeout has been reached.
         self.thread_pool.exit();
+
+        // Shut-down the async runtime used by fetch workers.
+        drop(HANDLE.lock().unwrap().take());
 
         debug!("Exited CoreResourceManager");
     }

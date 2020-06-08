@@ -280,16 +280,15 @@ impl CharacterDataMethods for CharacterData {
     }
 }
 
-#[allow(unsafe_code)]
-pub trait LayoutCharacterDataHelpers {
-    unsafe fn data_for_layout(&self) -> &str;
+pub trait LayoutCharacterDataHelpers<'dom> {
+    fn data_for_layout(self) -> &'dom str;
 }
 
-#[allow(unsafe_code)]
-impl LayoutCharacterDataHelpers for LayoutDom<CharacterData> {
+impl<'dom> LayoutCharacterDataHelpers<'dom> for LayoutDom<'dom, CharacterData> {
+    #[allow(unsafe_code)]
     #[inline]
-    unsafe fn data_for_layout(&self) -> &str {
-        &(*self.unsafe_get()).data.borrow_for_layout()
+    fn data_for_layout(self) -> &'dom str {
+        unsafe { self.unsafe_get().data.borrow_for_layout() }
     }
 }
 

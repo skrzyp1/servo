@@ -14,19 +14,15 @@ use std::sync::Arc;
 // Aux structs and enums.
 // ======================================================================
 
-/// Whether a consumer is in a position to request images or not. This can occur
-/// when animations are being processed by the layout thread while the script
-/// thread is executing in parallel.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub enum CanRequestImages {
-    No,
-    Yes,
-}
-
 /// Indicating either entire image or just metadata availability
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum ImageOrMetadataAvailable {
-    ImageAvailable(#[ignore_malloc_size_of = "Arc"] Arc<Image>, ServoUrl),
+    ImageAvailable {
+        #[ignore_malloc_size_of = "Arc"]
+        image: Arc<Image>,
+        url: ServoUrl,
+        is_placeholder: bool,
+    },
     MetadataAvailable(ImageMetadata),
 }
 
@@ -73,14 +69,6 @@ pub enum ImageResponse {
     None,
 }
 
-/// The current state of an image in the cache.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub enum ImageState {
-    Pending(PendingImageId),
-    LoadError,
-    NotRequested(PendingImageId),
-}
-
 /// The unique id for an image that has previously been requested.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
 pub struct PendingImageId(pub u64);
@@ -101,22 +89,48 @@ pub enum UsePlaceholder {
 // ImageCache public API.
 // ======================================================================
 
+pub enum ImageCacheResult {
+    Available(ImageOrMetadataAvailable),
+    LoadError,
+    Pending(PendingImageId),
+    ReadyForRequest(PendingImageId),
+}
+
 pub trait ImageCache: Sync + Send {
     fn new(webrender_api: WebrenderIpcSender) -> Self
     where
         Self: Sized;
 
-    /// Return any available metadata or image for the given URL,
-    /// or an indication that the image is not yet available if it is in progress,
-    /// or else reserve a slot in the cache for the URL if the consumer can request images.
-    fn find_image_or_metadata(
+    /// Definitively check whether there is a cached, fully loaded image available.
+    fn get_image(
+        &self,
+        url: ServoUrl,
+        origin: ImmutableOrigin,
+        cors_setting: Option<CorsSettings>,
+    ) -> Option<Arc<Image>>;
+
+    fn get_cached_image_status(
         &self,
         url: ServoUrl,
         origin: ImmutableOrigin,
         cors_setting: Option<CorsSettings>,
         use_placeholder: UsePlaceholder,
-        can_request: CanRequestImages,
-    ) -> Result<ImageOrMetadataAvailable, ImageState>;
+    ) -> ImageCacheResult;
+
+    /// Add a listener for the provided pending image id, eventually called by
+    /// ImageCacheStore::complete_load.
+    /// If only metadata is available, Available(ImageOrMetadataAvailable) will
+    /// be returned.
+    /// If Available(ImageOrMetadataAvailable::Image) or LoadError is the final value,
+    /// the provided listener will be dropped (consumed & not added to PendingLoad).
+    fn track_image(
+        &self,
+        url: ServoUrl,
+        origin: ImmutableOrigin,
+        cors_setting: Option<CorsSettings>,
+        sender: IpcSender<PendingImageResponse>,
+        use_placeholder: UsePlaceholder,
+    ) -> ImageCacheResult;
 
     /// Add a new listener for the given pending image id. If the image is already present,
     /// the responder will still receive the expected response.

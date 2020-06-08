@@ -27,6 +27,7 @@ use style::dom::TElement;
 use style::media_queries::Device;
 use style::shared_lock::SharedRwLockReadGuard;
 use style::stylesheets::Stylesheet;
+use style::stylist::CascadeData;
 
 /// Whether a shadow root hosts an User Agent widget.
 #[derive(JSTraceable, MallocSizeOf, PartialEq)]
@@ -239,46 +240,48 @@ impl ShadowRootMethods for ShadowRoot {
 }
 
 #[allow(unsafe_code)]
-pub trait LayoutShadowRootHelpers {
-    unsafe fn get_host_for_layout(&self) -> LayoutDom<Element>;
-    unsafe fn get_style_data_for_layout<'a, E: TElement>(
-        &self,
-    ) -> &'a AuthorStyles<StyleSheetInDocument>;
+pub trait LayoutShadowRootHelpers<'dom> {
+    fn get_host_for_layout(self) -> LayoutDom<'dom, Element>;
+    fn get_style_data_for_layout(self) -> &'dom CascadeData;
     unsafe fn flush_stylesheets<E: TElement>(
-        &self,
+        self,
         device: &Device,
         quirks_mode: QuirksMode,
         guard: &SharedRwLockReadGuard,
     );
 }
 
-impl LayoutShadowRootHelpers for LayoutDom<ShadowRoot> {
+impl<'dom> LayoutShadowRootHelpers<'dom> for LayoutDom<'dom, ShadowRoot> {
     #[inline]
     #[allow(unsafe_code)]
-    unsafe fn get_host_for_layout(&self) -> LayoutDom<Element> {
-        (*self.unsafe_get())
-            .host
-            .get_inner_as_layout()
-            .expect("We should never do layout on a detached shadow root")
+    fn get_host_for_layout(self) -> LayoutDom<'dom, Element> {
+        unsafe {
+            self.unsafe_get()
+                .host
+                .get_inner_as_layout()
+                .expect("We should never do layout on a detached shadow root")
+        }
     }
 
     #[inline]
     #[allow(unsafe_code)]
-    unsafe fn get_style_data_for_layout<'a, E: TElement>(
-        &self,
-    ) -> &'a AuthorStyles<StyleSheetInDocument> {
-        (*self.unsafe_get()).author_styles.borrow_for_layout()
+    fn get_style_data_for_layout(self) -> &'dom CascadeData {
+        fn is_sync<T: Sync>() {}
+        let _ = is_sync::<CascadeData>;
+        unsafe { &self.unsafe_get().author_styles.borrow_for_layout().data }
     }
 
+    // FIXME(nox): This uses the dreaded borrow_mut_for_layout so this should
+    // probably be revisited.
     #[inline]
     #[allow(unsafe_code)]
     unsafe fn flush_stylesheets<E: TElement>(
-        &self,
+        self,
         device: &Device,
         quirks_mode: QuirksMode,
         guard: &SharedRwLockReadGuard,
     ) {
-        let mut author_styles = (*self.unsafe_get()).author_styles.borrow_mut_for_layout();
+        let author_styles = self.unsafe_get().author_styles.borrow_mut_for_layout();
         if author_styles.stylesheets.dirty() {
             author_styles.flush::<E>(device, quirks_mode, guard);
         }

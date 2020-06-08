@@ -223,34 +223,6 @@ def append_to_path_env(string, env, name):
     env[name] = variable
 
 
-def set_osmesa_env(bin_path, env, show_vars):
-    """Set proper LD_LIBRARY_PATH and DRIVE for software rendering on Linux and OSX"""
-    if is_linux():
-        dep_path = find_dep_path_newest('osmesa-src', bin_path)
-        if not dep_path:
-            return None
-        osmesa_path = path.join(dep_path, "out", "lib", "gallium")
-        append_to_path_env(osmesa_path, env, "LD_LIBRARY_PATH")
-        env["GALLIUM_DRIVER"] = "softpipe"
-        if show_vars:
-            print("GALLIUM_DRIVER=" + env["GALLIUM_DRIVER"])
-            print("LD_LIBRARY_PATH=" + env["LD_LIBRARY_PATH"])
-    elif is_macosx():
-        osmesa_dep_path = find_dep_path_newest('osmesa-src', bin_path)
-        if not osmesa_dep_path:
-            return None
-        osmesa_path = path.join(osmesa_dep_path,
-                                "out", "src", "gallium", "targets", "osmesa", ".libs")
-        glapi_path = path.join(osmesa_dep_path,
-                               "out", "src", "mapi", "shared-glapi", ".libs")
-        append_to_path_env(osmesa_path + ":" + glapi_path, env, "DYLD_LIBRARY_PATH")
-        env["GALLIUM_DRIVER"] = "softpipe"
-        if show_vars:
-            print("GALLIUM_DRIVER=" + env["GALLIUM_DRIVER"])
-            print("DYLD_LIBRARY_PATH=" + env["DYLD_LIBRARY_PATH"])
-    return env
-
-
 def gstreamer_root(target, env, topdir=None):
     if is_windows():
         arch = {
@@ -687,7 +659,7 @@ install them, let us know by filing a bug!")
             distrib, version, _ = distro.linux_distribution()
             distrib = six.ensure_str(distrib)
             version = six.ensure_str(version)
-            if distrib == "Ubuntu" and (version == "16.04" or version == "14.04"):
+            if distrib == "Ubuntu" and version == "16.04":
                 env["HARFBUZZ_SYS_NO_PKG_CONFIG"] = "true"
 
         if extra_path:
@@ -724,7 +696,7 @@ install them, let us know by filing a bug!")
 
         # These are set because they are the variable names that build-apk
         # expects. However, other submodules have makefiles that reference
-        # the env var names above. Once glutin is enabled and set as the
+        # the env var names above. Once winit is enabled and set as the
         # default, we could modify the subproject makefiles to use the names
         # below and remove the vars above, to avoid duplication.
         if "ANDROID_SDK" in env:
@@ -762,9 +734,28 @@ install them, let us know by filing a bug!")
 
         git_info = []
         if os.path.isdir('.git') and is_build:
-            git_sha = subprocess.check_output([
-                'git', 'rev-parse', '--short', 'HEAD'
+            # Get the subject of the commit
+            git_commit_subject = subprocess.check_output([
+                'git', 'show', '-s', '--format=%s', 'HEAD'
             ]).strip()
+
+            git_sha = None
+            # Check if it's a bundle commit
+            if git_commit_subject.startswith(b"Shallow version of commit "):
+                # This is a bundle commit
+                # Get the SHA-1 from the bundle subject: "Shallow version of commit {sha1}"
+                git_sha = git_commit_subject.split(b' ')[-1].strip()
+                # Shorten hash
+                # NOTE: Partially verifies the hash, but it will still pass if it's, e.g., a tree
+                git_sha = subprocess.check_output([
+                    'git', 'rev-parse', '--short', git_sha
+                ])
+            else:
+                # This is a regular commit
+                git_sha = subprocess.check_output([
+                    'git', 'rev-parse', '--short', 'HEAD'
+                ]).strip()
+
             git_is_dirty = bool(subprocess.check_output([
                 'git', 'status', '--porcelain'
             ]).strip())
@@ -897,7 +888,7 @@ install them, let us know by filing a bug!")
                     api = "capi"
                 port = path.join("libsimpleservo", api)
             else:
-                port = "glutin"
+                port = "winit"
             args += [
                 "--manifest-path",
                 path.join(self.context.topdir, "ports", port, "Cargo.toml"),
@@ -1014,7 +1005,13 @@ install them, let us know by filing a bug!")
             installed = check_output(
                 ["rustup", "component", "list", "--installed", "--toolchain", toolchain]
             )
-            for component in set(rustup_components or []) | {"rustc-dev"}:
+            required_components = {
+                # For components/script_plugins, https://github.com/rust-lang/rust/pull/67469
+                "rustc-dev",
+                # https://github.com/rust-lang/rust/issues/72594#issuecomment-633779564
+                "llvm-tools-preview",
+            }
+            for component in set(rustup_components or []) | required_components:
                 if component.encode("utf-8") not in installed:
                     check_call(["rustup", "component", "add", "--toolchain", toolchain, component])
 

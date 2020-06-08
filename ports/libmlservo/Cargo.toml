@@ -18,13 +18,11 @@ layout-2013 = ["simpleservo/layout-2013"]
 layout-2020 = ["simpleservo/layout-2020"]
 
 [dependencies]
-libservo = { path = "../../components/servo", features = ["no_static_freetype"] }
-simpleservo = { path = "../libsimpleservo/api", features = ["no_static_freetype"] }
-rust-webvr = { version = "0.19", features = ["magicleap"] }
-webxr-api = { git = "https://github.com/servo/webxr", features = ["ipc"] }
-webxr = { git = "https://github.com/servo/webxr", features = ["ipc", "magicleap"] }
 libc = "0.2"
+libservo = { path = "../../components/servo", features = ["no_static_freetype"] }
 log = "0.4"
 servo-egl = "0.2"
-smallvec = "0.6"
-
+simpleservo = { path = "../libsimpleservo/api", features = ["no_static_freetype"] }
+smallvec = "1.3"
+webxr = { git = "https://github.com/servo/webxr", features = ["ipc", "magicleap"] }
+webxr-api = { git = "https://github.com/servo/webxr", features = ["ipc"] }

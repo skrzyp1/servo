@@ -45,10 +45,10 @@ use servo_atoms::Atom;
 use servo_url::ImmutableOrigin;
 use servo_url::ServoUrl;
 use std::cell::Cell;
-use std::fs::File;
-use std::io::{Read, Write};
+use std::fs::{create_dir_all, read_to_string, File};
+use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use style::str::{StaticStringVec, HTML_SPACE_CHARACTERS};
 use uuid::Uuid;
@@ -458,6 +458,7 @@ impl HTMLScriptElement {
                 &text,
             ) == csp::CheckResult::Blocked
         {
+            warn!("Blocking inline script due to CSP");
             return;
         }
 
@@ -662,22 +663,31 @@ impl HTMLScriptElement {
             return;
         }
 
-        match Command::new("js-beautify")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-        {
-            Err(_) => {
-                warn!("Failed to execute js-beautify. Will store unmodified script");
-            },
-            Ok(process) => {
-                let mut script_content = String::from(script.text.clone());
-                let _ = process.stdin.unwrap().write_all(script_content.as_bytes());
-                script_content.clear();
-                let _ = process.stdout.unwrap().read_to_string(&mut script_content);
-
-                script.text = DOMString::from(script_content);
-            },
+        // Write the minified code to a temporary file and pass its path as an argument
+        // to js-beautify to read from. Meanwhile, redirect the process' stdout into
+        // another temporary file and read that into a string. This avoids some hangs
+        // observed on macOS when using direct input/output pipes with very large
+        // unminified content.
+        let (input, output) = (tempfile::NamedTempFile::new(), tempfile::tempfile());
+        if let (Ok(mut input), Ok(mut output)) = (input, output) {
+            input.write_all(script.text.as_bytes()).unwrap();
+            match Command::new("js-beautify")
+                .arg(input.path())
+                .stdout(output.try_clone().unwrap())
+                .status()
+            {
+                Ok(status) if status.success() => {
+                    let mut script_content = String::new();
+                    output.seek(std::io::SeekFrom::Start(0)).unwrap();
+                    output.read_to_string(&mut script_content).unwrap();
+                    script.text = DOMString::from(script_content);
+                },
+                _ => {
+                    warn!("Failed to execute js-beautify. Will store unmodified script");
+                },
+            }
+        } else {
+            warn!("Error creating input and output files for unminify");
         }
 
         let path;
@@ -688,17 +698,34 @@ impl HTMLScriptElement {
                 return;
             },
         }
-
-        let path = if script.external {
+        let (base, has_name) = match script.url.as_str().ends_with("/") {
+            true => (
+                path.join(&script.url[url::Position::BeforeHost..])
+                    .as_path()
+                    .to_owned(),
+                false,
+            ),
+            false => (
+                path.join(&script.url[url::Position::BeforeHost..])
+                    .parent()
+                    .unwrap()
+                    .to_owned(),
+                true,
+            ),
+        };
+        match create_dir_all(base.clone()) {
+            Ok(()) => debug!("Created base dir: {:?}", base),
+            Err(e) => {
+                debug!("Failed to create base dir: {:?}, {:?}", base, e);
+                return;
+            },
+        }
+        let path = if script.external && has_name {
             // External script.
-            let path_parts = script.url.path_segments().unwrap();
-            match path_parts.last() {
-                Some(script_name) => path.join(script_name),
-                None => path.join(Uuid::new_v4().to_string()),
-            }
+            path.join(&script.url[url::Position::BeforeHost..])
         } else {
-            // Inline script.
-            path.join(Uuid::new_v4().to_string())
+            // Inline script or url ends with '/'
+            base.join(Uuid::new_v4().to_string())
         };
 
         debug!("script will be stored in {:?}", path);
@@ -706,6 +733,34 @@ impl HTMLScriptElement {
         match File::create(&path) {
             Ok(mut file) => file.write_all(script.text.as_bytes()).unwrap(),
             Err(why) => warn!("Could not store script {:?}", why),
+        }
+    }
+
+    fn substitute_with_local_script(&self, script: &mut ScriptOrigin) {
+        if self
+            .parser_document
+            .window()
+            .local_script_source()
+            .is_none() ||
+            !script.external
+        {
+            return;
+        }
+        let mut path = PathBuf::from(
+            self.parser_document
+                .window()
+                .local_script_source()
+                .clone()
+                .unwrap(),
+        );
+        path = path.join(&script.url[url::Position::BeforeHost..]);
+        debug!("Attempting to read script stored at: {:?}", path);
+        match read_to_string(path.clone()) {
+            Ok(local_script) => {
+                debug!("Found script stored at: {:?}", path);
+                script.text = DOMString::from(local_script);
+            },
+            Err(why) => warn!("Could not restore script from file {:?}", why),
         }
     }
 
@@ -730,6 +785,7 @@ impl HTMLScriptElement {
 
         if script.type_ == ScriptType::Classic {
             self.unminify_js(&mut script);
+            self.substitute_with_local_script(&mut script);
         }
 
         // Step 3.
@@ -747,13 +803,17 @@ impl HTMLScriptElement {
         let old_script = document.GetCurrentScript();
 
         match script.type_ {
+            ScriptType::Classic => document.set_current_script(Some(self)),
+            ScriptType::Module => document.set_current_script(None),
+        }
+
+        match script.type_ {
             ScriptType::Classic => {
-                document.set_current_script(Some(self));
                 self.run_a_classic_script(&script);
                 document.set_current_script(old_script.as_deref());
             },
             ScriptType::Module => {
-                assert!(old_script.is_none());
+                assert!(document.GetCurrentScript().is_none());
                 self.run_a_module_script(&script, false);
             },
         }

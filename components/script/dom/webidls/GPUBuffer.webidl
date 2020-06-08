@@ -5,7 +5,7 @@
 // https://gpuweb.github.io/gpuweb/#gpubuffer
 [Exposed=(Window, DedicatedWorker), Serializable, Pref="dom.webgpu.enabled"]
 interface GPUBuffer {
-    Promise<ArrayBuffer> mapReadAsync();
+    //Promise<ArrayBuffer> mapReadAsync();
     // Promise<ArrayBuffer> mapWriteAsync();
     void unmap();
 
@@ -14,11 +14,11 @@ interface GPUBuffer {
 GPUBuffer includes GPUObjectBase;
 
 dictionary GPUBufferDescriptor : GPUObjectDescriptorBase {
-    required GPUBufferSize size;
+    required GPUSize64 size;
     required GPUBufferUsageFlags usage;
 };
 
-typedef unsigned long long GPUBufferSize;
+typedef unsigned long long GPUSize64;
 
 typedef unsigned long GPUBufferUsageFlags;
 

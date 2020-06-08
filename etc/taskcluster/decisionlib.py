@@ -157,6 +157,10 @@ class Task:
 
     with_extra = chaining(update_attr, "extra")
 
+    def with_index_at(self, index_path):
+        self.routes.append("index.%s.%s" % (CONFIG.index_prefix, index_path))
+        return self
+
     def with_treeherder_required(self):
         self.treeherder_required = True
         return self
@@ -291,7 +295,7 @@ class Task:
             if e.status_code != 404:  # pragma: no cover
                 raise
             if not CONFIG.index_read_only:
-                self.routes.append("index.%s.%s" % (CONFIG.index_prefix, index_path))
+                self.with_index_at(index_path)
             task_id = self.create()
 
         SHARED.found_or_created_indexed_tasks[index_path] = task_id
@@ -458,9 +462,29 @@ class WindowsGenericWorkerTask(GenericWorkerTask):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.scripts = []
+        self.rdp_info_artifact_name = None
 
     with_script = chaining(append_to_attr, "scripts")
     with_early_script = chaining(prepend_to_attr, "scripts")
+
+    def build_worker_payload(self):
+        if self.rdp_info_artifact_name:
+            rdp_scope = "generic-worker:allow-rdp:%s/%s" % (self.provisioner_id, self.worker_type)
+            self.scopes.append(rdp_scope)
+        return dict_update_if_truthy(
+            super().build_worker_payload(),
+            rdpInfo=self.rdp_info_artifact_name,
+        )
+
+    def with_rdp_info(self, *, artifact_name):
+        """
+        Enable RDP access to this task’s environment.
+
+        See `rdpInfo` in
+        <https://community-tc.services.mozilla.com/docs/reference/workers/generic-worker/multiuser-windows-payload>
+        """
+        assert not artifact_name.startswith("public/")
+        self.rdp_info_artifact_name = artifact_name
 
     def build_command(self):
         return [deindent(s) for s in self.scripts]
@@ -531,10 +555,10 @@ class WindowsGenericWorkerTask(GenericWorkerTask):
 
     def with_curl(self):
         return self \
-        .with_path_from_homedir("curl\\curl-7.67.0-win64-mingw\\bin") \
+        .with_path_from_homedir("curl\\curl-7.69.0-win64-mingw\\bin") \
         .with_directory_mount(
-            "https://curl.haxx.se/windows/dl-7.67.0_4/curl-7.67.0_4-win64-mingw.zip",
-            sha256="1d50deeac7f945ed75149e6300f6d21f007a6b942ab851a119ed76cdef27d714",
+            "https://curl.haxx.se/windows/dl-7.69.0/curl-7.69.0-win64-mingw.zip",
+            sha256="1c3caf39bf8ad2794b0515a09b3282f85a7ccfcf753ea639f2ef99e50351ade0",
             path="curl",
         )
 
@@ -665,7 +689,7 @@ class MacOsGenericWorkerTask(UnixTaskMixin, GenericWorkerTask):
         # So concatenate scripts and use a single `bash` command instead.
         return [
             [
-                "/bin/bash", "--login", "-x", "-e", "-c",
+                "/bin/bash", "--login", "-x", "-e", "-o", "pipefail", "-c",
                 deindent("\n".join(self.scripts))
             ]
         ]
@@ -729,7 +753,7 @@ class DockerWorkerTask(UnixTaskMixin, Task):
             "image": self.docker_image,
             "maxRunTime": self.max_run_time_minutes * 60,
             "command": [
-                "/bin/bash", "--login", "-x", "-e", "-c",
+                "/bin/bash", "--login", "-x", "-e", "-o", "pipefail", "-c",
                 deindent("\n".join(self.scripts))
             ],
         }

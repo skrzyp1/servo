@@ -36,8 +36,8 @@ use crate::dom::bindings::reflector::{DomObject, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::utils::WindowProxyHandler;
-use crate::dom::document::PendingRestyle;
 use crate::dom::gpubuffer::GPUBufferState;
+use crate::dom::gpucommandencoder::GPUCommandEncoderState;
 use crate::dom::htmlimageelement::SourceSet;
 use crate::dom::htmlmediaelement::{HTMLMediaElementFetchContext, MediaFrameRenderer};
 use crate::dom::identityhub::Identities;
@@ -86,6 +86,7 @@ use msg::constellation_msg::{
     BlobId, BroadcastChannelRouterId, BrowsingContextId, HistoryStateId, MessagePortId,
     MessagePortRouterId, PipelineId, TopLevelBrowsingContextId,
 };
+use msg::constellation_msg::{ServiceWorkerId, ServiceWorkerRegistrationId};
 use net_traits::filemanager_thread::RelativePos;
 use net_traits::image::base::{Image, ImageMetadata};
 use net_traits::image_cache::{ImageCache, PendingImageId};
@@ -94,15 +95,19 @@ use net_traits::response::HttpsState;
 use net_traits::response::{Response, ResponseBody};
 use net_traits::storage_thread::StorageType;
 use net_traits::{Metadata, NetworkError, ReferrerPolicy, ResourceFetchTiming, ResourceThreads};
+use parking_lot::{Mutex as ParkMutex, RwLock};
 use profile_traits::mem::ProfilerChan as MemProfilerChan;
 use profile_traits::time::ProfilerChan as TimeProfilerChan;
+use script_layout_interface::message::PendingRestyle;
 use script_layout_interface::rpc::LayoutRPC;
-use script_layout_interface::OpaqueStyleAndLayoutData;
+use script_layout_interface::StyleAndOpaqueLayoutData;
 use script_traits::serializable::BlobImpl;
 use script_traits::transferable::MessagePortImpl;
-use script_traits::{DocumentActivity, DrawAPaintImageResult};
-use script_traits::{MediaSessionActionType, ScriptToConstellationChan, TimerEventId, TimerSource};
-use script_traits::{UntrustedNodeAddress, WebrenderIpcSender, WindowSizeData, WindowSizeType};
+use script_traits::{
+    DocumentActivity, DrawAPaintImageResult, MediaSessionActionType, ScriptToConstellationChan,
+    TimerEventId, TimerSource, UntrustedNodeAddress, WebrenderIpcSender, WindowSizeData,
+    WindowSizeType,
+};
 use selectors::matching::ElementSelectorFlags;
 use serde::{Deserialize, Serialize};
 use servo_arc::Arc as ServoArc;
@@ -130,7 +135,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime};
+use style::animation::ElementAnimationSet;
 use style::attr::{AttrIdentifier, AttrValue, LengthOrPercentageOrAuto};
 use style::author_styles::AuthorStyles;
 use style::context::QuirksMode;
@@ -154,13 +161,15 @@ use uuid::Uuid;
 use webgpu::{
     wgpu::command::RawPass, WebGPU, WebGPUAdapter, WebGPUBindGroup, WebGPUBindGroupLayout,
     WebGPUBuffer, WebGPUCommandBuffer, WebGPUCommandEncoder, WebGPUComputePipeline, WebGPUDevice,
-    WebGPUPipelineLayout, WebGPUQueue, WebGPUShaderModule,
+    WebGPUPipelineLayout, WebGPUQueue, WebGPURenderPipeline, WebGPUSampler, WebGPUShaderModule,
+    WebGPUTexture, WebGPUTextureView,
 };
 use webrender_api::{DocumentId, ImageKey};
-use webvr_traits::{WebVRGamepadData, WebVRGamepadHand, WebVRGamepadState};
 use webxr_api::SwapChainId as WebXRSwapChainId;
+use webxr_api::{Finger, Hand, Ray, View};
 
 unsafe_no_jsmanaged_fields!(Tm);
+unsafe_no_jsmanaged_fields!(JoinHandle<()>);
 
 /// A trait to allow tracing (only) DOM objects.
 pub unsafe trait JSTraceable {
@@ -172,8 +181,10 @@ unsafe_no_jsmanaged_fields!(Box<dyn TaskBox>, Box<dyn EventLoopWaker>);
 
 unsafe_no_jsmanaged_fields!(MessagePortImpl);
 unsafe_no_jsmanaged_fields!(MessagePortId);
-unsafe_no_jsmanaged_fields!(RefCell<Option<MessagePortId>>);
 unsafe_no_jsmanaged_fields!(MessagePortRouterId);
+
+unsafe_no_jsmanaged_fields!(ServiceWorkerId);
+unsafe_no_jsmanaged_fields!(ServiceWorkerRegistrationId);
 
 unsafe_no_jsmanaged_fields!(BroadcastChannelRouterId);
 
@@ -184,8 +195,7 @@ unsafe_no_jsmanaged_fields!(CSSError);
 
 unsafe_no_jsmanaged_fields!(&'static Encoding);
 
-unsafe_no_jsmanaged_fields!(RefCell<Decoder>);
-unsafe_no_jsmanaged_fields!(RefCell<Vec<u8>>);
+unsafe_no_jsmanaged_fields!(Decoder);
 
 unsafe_no_jsmanaged_fields!(Reflector);
 
@@ -252,6 +262,12 @@ unsafe impl<T: JSTraceable> JSTraceable for ServoArc<T> {
     }
 }
 
+unsafe impl<T: JSTraceable> JSTraceable for RwLock<T> {
+    unsafe fn trace(&self, trc: *mut JSTracer) {
+        self.read().trace(trc)
+    }
+}
+
 unsafe impl<T: JSTraceable + ?Sized> JSTraceable for Box<T> {
     unsafe fn trace(&self, trc: *mut JSTracer) {
         (**self).trace(trc)
@@ -279,6 +295,12 @@ unsafe impl<T: JSTraceable> JSTraceable for UnsafeCell<T> {
 }
 
 unsafe impl<T: JSTraceable> JSTraceable for DomRefCell<T> {
+    unsafe fn trace(&self, trc: *mut JSTracer) {
+        (*self).borrow().trace(trc)
+    }
+}
+
+unsafe impl<T: JSTraceable> JSTraceable for RefCell<T> {
     unsafe fn trace(&self, trc: *mut JSTracer) {
         (*self).borrow().trace(trc)
     }
@@ -508,7 +530,7 @@ unsafe_no_jsmanaged_fields!(StatusCode);
 unsafe_no_jsmanaged_fields!(SystemTime);
 unsafe_no_jsmanaged_fields!(Instant);
 unsafe_no_jsmanaged_fields!(RelativePos);
-unsafe_no_jsmanaged_fields!(OpaqueStyleAndLayoutData);
+unsafe_no_jsmanaged_fields!(StyleAndOpaqueLayoutData);
 unsafe_no_jsmanaged_fields!(PathBuf);
 unsafe_no_jsmanaged_fields!(DrawAPaintImageResult);
 unsafe_no_jsmanaged_fields!(DocumentId);
@@ -530,31 +552,37 @@ unsafe_no_jsmanaged_fields!(WebGLTextureId);
 unsafe_no_jsmanaged_fields!(WebGLVertexArrayId);
 unsafe_no_jsmanaged_fields!(WebGLVersion);
 unsafe_no_jsmanaged_fields!(WebGLSLVersion);
-unsafe_no_jsmanaged_fields!(RefCell<Option<WebGPU>>);
-unsafe_no_jsmanaged_fields!(RefCell<Identities>);
+unsafe_no_jsmanaged_fields!(Arc<ParkMutex<Identities>>);
 unsafe_no_jsmanaged_fields!(WebGPU);
 unsafe_no_jsmanaged_fields!(WebGPUAdapter);
 unsafe_no_jsmanaged_fields!(WebGPUBuffer);
 unsafe_no_jsmanaged_fields!(WebGPUBindGroup);
 unsafe_no_jsmanaged_fields!(WebGPUBindGroupLayout);
 unsafe_no_jsmanaged_fields!(WebGPUComputePipeline);
+unsafe_no_jsmanaged_fields!(WebGPURenderPipeline);
 unsafe_no_jsmanaged_fields!(WebGPUPipelineLayout);
 unsafe_no_jsmanaged_fields!(WebGPUQueue);
 unsafe_no_jsmanaged_fields!(WebGPUShaderModule);
+unsafe_no_jsmanaged_fields!(WebGPUSampler);
+unsafe_no_jsmanaged_fields!(WebGPUTexture);
+unsafe_no_jsmanaged_fields!(WebGPUTextureView);
 unsafe_no_jsmanaged_fields!(WebGPUCommandBuffer);
 unsafe_no_jsmanaged_fields!(WebGPUCommandEncoder);
 unsafe_no_jsmanaged_fields!(WebGPUDevice);
-unsafe_no_jsmanaged_fields!(RefCell<Option<RawPass>>);
+unsafe_no_jsmanaged_fields!(Option<RawPass>);
 unsafe_no_jsmanaged_fields!(GPUBufferState);
+unsafe_no_jsmanaged_fields!(GPUCommandEncoderState);
 unsafe_no_jsmanaged_fields!(WebXRSwapChainId);
 unsafe_no_jsmanaged_fields!(MediaList);
-unsafe_no_jsmanaged_fields!(WebVRGamepadData, WebVRGamepadState, WebVRGamepadHand);
 unsafe_no_jsmanaged_fields!(
     webxr_api::Registry,
     webxr_api::Session,
     webxr_api::Frame,
     webxr_api::InputSource,
-    webxr_api::InputId
+    webxr_api::InputId,
+    webxr_api::Joint,
+    webxr_api::HitTestId,
+    webxr_api::HitTestResult
 );
 unsafe_no_jsmanaged_fields!(ScriptToConstellationChan);
 unsafe_no_jsmanaged_fields!(InteractiveMetrics);
@@ -584,6 +612,7 @@ unsafe_no_jsmanaged_fields!(MediaSessionActionType);
 unsafe_no_jsmanaged_fields!(MediaMetadata);
 unsafe_no_jsmanaged_fields!(WebrenderIpcSender);
 unsafe_no_jsmanaged_fields!(StreamConsumer);
+unsafe_no_jsmanaged_fields!(ElementAnimationSet);
 
 unsafe impl<'a> JSTraceable for &'a str {
     #[inline]
@@ -752,6 +781,20 @@ unsafe impl<U> JSTraceable for euclid::Rect<i32, U> {
     }
 }
 
+unsafe impl<Space> JSTraceable for Ray<Space> {
+    #[inline]
+    unsafe fn trace(&self, _trc: *mut JSTracer) {
+        // Do nothing
+    }
+}
+
+unsafe impl<Eye> JSTraceable for View<Eye> {
+    #[inline]
+    unsafe fn trace(&self, _trc: *mut JSTracer) {
+        // Do nothing
+    }
+}
+
 unsafe impl JSTraceable for StyleLocked<FontFaceRule> {
     unsafe fn trace(&self, _trc: *mut JSTracer) {
         // Do nothing.
@@ -870,6 +913,58 @@ where
 {
     unsafe fn trace(&self, tracer: *mut JSTracer) {
         self.inner_sink().trace(tracer);
+    }
+}
+
+unsafe impl<J> JSTraceable for Hand<J>
+where
+    J: JSTraceable,
+{
+    #[inline]
+    unsafe fn trace(&self, trc: *mut JSTracer) {
+        // exhaustive match so we don't miss new fields
+        let Hand {
+            ref wrist,
+            ref thumb_metacarpal,
+            ref thumb_phalanx_proximal,
+            ref thumb_phalanx_distal,
+            ref thumb_phalanx_tip,
+            ref index,
+            ref middle,
+            ref ring,
+            ref little,
+        } = *self;
+        wrist.trace(trc);
+        thumb_metacarpal.trace(trc);
+        thumb_phalanx_proximal.trace(trc);
+        thumb_phalanx_distal.trace(trc);
+        thumb_phalanx_tip.trace(trc);
+        index.trace(trc);
+        middle.trace(trc);
+        ring.trace(trc);
+        little.trace(trc);
+    }
+}
+
+unsafe impl<J> JSTraceable for Finger<J>
+where
+    J: JSTraceable,
+{
+    #[inline]
+    unsafe fn trace(&self, trc: *mut JSTracer) {
+        // exhaustive match so we don't miss new fields
+        let Finger {
+            ref metacarpal,
+            ref phalanx_proximal,
+            ref phalanx_intermediate,
+            ref phalanx_distal,
+            ref phalanx_tip,
+        } = *self;
+        metacarpal.trace(trc);
+        phalanx_proximal.trace(trc);
+        phalanx_intermediate.trace(trc);
+        phalanx_distal.trace(trc);
+        phalanx_tip.trace(trc);
     }
 }
 

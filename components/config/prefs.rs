@@ -193,6 +193,9 @@ mod gen {
                 gamepad: {
                     enabled: bool,
                 },
+                imagebitmap: {
+                    enabled: bool,
+                },
                 microdata: {
                     testing: {
                         enabled: bool,
@@ -289,11 +292,6 @@ mod gen {
                     #[serde(default)]
                     enabled: bool,
                 },
-                webvr: {
-                    enabled: bool,
-                    event_polling_interval: i64,
-                    test: bool,
-                },
                 webvtt: {
                     enabled: bool,
                 },
@@ -302,8 +300,21 @@ mod gen {
                     enabled: bool,
                     #[serde(default)]
                     test: bool,
-                    #[serde(default)]
-                    glwindow: bool,
+                    glwindow: {
+                        #[serde(default)]
+                        enabled: bool,
+                        #[serde(rename = "dom.webxr.glwindow.left-right")]
+                        left_right: bool,
+                        #[serde(rename = "dom.webxr.glwindow.red-cyan")]
+                        red_cyan: bool,
+                    },
+                    hands: {
+                        #[serde(default)]
+                        enabled: bool,
+                    },
+                    layers: {
+                        enabled: bool,
+                    }
                 },
                 worklet: {
                     blockingsleep: {
@@ -323,7 +334,11 @@ mod gen {
                 subpixel_text_antialiasing: {
                     #[serde(rename = "gfx.subpixel-text-antialiasing.enabled")]
                     enabled: bool,
-                }
+                },
+                texture_swizzling: {
+                    #[serde(rename = "gfx.texture-swizzling.enabled")]
+                    enabled: bool,
+                },
             },
             js: {
                 asmjs: {
@@ -437,6 +452,9 @@ mod gen {
                     }
                 },
                 columns: {
+                    enabled: bool,
+                },
+                flexbox: {
                     enabled: bool,
                 },
                 #[serde(default = "default_layout_threads")]

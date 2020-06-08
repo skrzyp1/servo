@@ -442,6 +442,8 @@ macro_rules! global_event_handlers(
     );
     (NoOnload) => (
         event_handler!(abort, GetOnabort, SetOnabort);
+        event_handler!(animationend, GetOnanimationend, SetOnanimationend);
+        event_handler!(animationiteration, GetOnanimationiteration, SetOnanimationiteration);
         event_handler!(cancel, GetOncancel, SetOncancel);
         event_handler!(canplay, GetOncanplay, SetOncanplay);
         event_handler!(canplaythrough, GetOncanplaythrough, SetOncanplaythrough);
@@ -496,7 +498,9 @@ macro_rules! global_event_handlers(
         event_handler!(suspend, GetOnsuspend, SetOnsuspend);
         event_handler!(timeupdate, GetOntimeupdate, SetOntimeupdate);
         event_handler!(toggle, GetOntoggle, SetOntoggle);
+        event_handler!(transitioncancel, GetOntransitioncancel, SetOntransitioncancel);
         event_handler!(transitionend, GetOntransitionend, SetOntransitionend);
+        event_handler!(transitionrun, GetOntransitionrun, SetOntransitionrun);
         event_handler!(volumechange, GetOnvolumechange, SetOnvolumechange);
         event_handler!(waiting, GetOnwaiting, SetOnwaiting);
     )
@@ -527,13 +531,6 @@ macro_rules! window_event_handlers(
         event_handler!(unhandledrejection, GetOnunhandledrejection,
                        SetOnunhandledrejection);
         event_handler!(unload, GetOnunload, SetOnunload);
-        event_handler!(vrdisplayconnect, GetOnvrdisplayconnect, SetOnvrdisplayconnect);
-        event_handler!(vrdisplaydisconnect, GetOnvrdisplaydisconnect, SetOnvrdisplaydisconnect);
-        event_handler!(vrdisplayactivate, GetOnvrdisplayactivate, SetOnvrdisplayactivate);
-        event_handler!(vrdisplaydeactivate, GetOnvrdisplaydeactivate, SetOnvrdisplaydeactivate);
-        event_handler!(vrdisplayblur, GetOnvrdisplayblur, SetOnvrdisplayblur);
-        event_handler!(vrdisplayfocus, GetOnvrdisplayfocus, SetOnvrdisplayfocus);
-        event_handler!(vrdisplaypresentchange, GetOnvrdisplaypresentchange, SetOnvrdisplaypresentchange);
     );
     (ForwardToWindow) => (
         window_owned_event_handler!(afterprint, GetOnafterprint,
@@ -560,14 +557,6 @@ macro_rules! window_event_handlers(
         window_owned_event_handler!(unhandledrejection, GetOnunhandledrejection,
                                     SetOnunhandledrejection);
         window_owned_event_handler!(unload, GetOnunload, SetOnunload);
-
-        window_owned_event_handler!(vrdisplayconnect, GetOnvrdisplayconnect, SetOnvrdisplayconnect);
-        window_owned_event_handler!(vrdisplaydisconnect, GetOnvrdisplaydisconnect, SetOnvrdisplaydisconnect);
-        window_owned_event_handler!(vrdisplayactivate, GetOnvrdisplayactivate, SetOnvrdisplayactivate);
-        window_owned_event_handler!(vrdisplaydeactivate, GetOnvrdisplaydeactivate, SetOnvrdisplaydeactivate);
-        window_owned_event_handler!(vrdisplayblur, GetOnvrdisplayblur, SetOnvrdisplayblur);
-        window_owned_event_handler!(vrdisplayfocus, GetOnvrdisplayfocus, SetOnvrdisplayfocus);
-        window_owned_event_handler!(vrdisplaypresentchange, GetOnvrdisplaypresentchange, SetOnvrdisplaypresentchange);
     );
 );
 
@@ -670,11 +659,6 @@ macro_rules! impl_rare_data (
             RefMut::map(rare_data, |rare_data| {
                 rare_data.as_mut().unwrap()
             })
-        }
-
-        #[allow(unsafe_code)]
-        fn rare_data_for_layout(&self) -> &Option<Box<$type>> {
-            unsafe { self.rare_data.borrow_for_layout() }
         }
     );
 );

@@ -7,7 +7,7 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{DomRoot, LayoutDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
-use crate::dom::element::{AttributeMutation, Element, RawLayoutElementHelpers};
+use crate::dom::element::{AttributeMutation, Element, LayoutElementHelpers};
 use crate::dom::node::Node;
 use crate::dom::svggraphicselement::SVGGraphicsElement;
 use crate::dom::virtualmethods::VirtualMethods;
@@ -49,25 +49,20 @@ impl SVGSVGElement {
 }
 
 pub trait LayoutSVGSVGElementHelpers {
-    fn data(&self) -> SVGSVGData;
+    fn data(self) -> SVGSVGData;
 }
 
-impl LayoutSVGSVGElementHelpers for LayoutDom<SVGSVGElement> {
-    #[allow(unsafe_code, non_snake_case)]
-    fn data(&self) -> SVGSVGData {
-        unsafe {
-            let SVG = &*self.unsafe_get();
-
-            let width_attr = SVG
-                .upcast::<Element>()
-                .get_attr_for_layout(&ns!(), &local_name!("width"));
-            let height_attr = SVG
-                .upcast::<Element>()
-                .get_attr_for_layout(&ns!(), &local_name!("height"));
-            SVGSVGData {
-                width: width_attr.map_or(DEFAULT_WIDTH, |val| val.as_uint()),
-                height: height_attr.map_or(DEFAULT_HEIGHT, |val| val.as_uint()),
-            }
+impl LayoutSVGSVGElementHelpers for LayoutDom<'_, SVGSVGElement> {
+    fn data(self) -> SVGSVGData {
+        let width_attr = self
+            .upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("width"));
+        let height_attr = self
+            .upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("height"));
+        SVGSVGData {
+            width: width_attr.map_or(DEFAULT_WIDTH, |val| val.as_uint()),
+            height: height_attr.map_or(DEFAULT_HEIGHT, |val| val.as_uint()),
         }
     }
 }

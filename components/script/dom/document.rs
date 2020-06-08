@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use crate::animation_timeline::AnimationTimeline;
+use crate::animations::Animations;
 use crate::document_loader::{DocumentLoader, LoadType};
 use crate::dom::attr::Attr;
 use crate::dom::beforeunloadevent::BeforeUnloadEvent;
@@ -71,7 +73,7 @@ use crate::dom::location::Location;
 use crate::dom::messageevent::MessageEvent;
 use crate::dom::mouseevent::MouseEvent;
 use crate::dom::node::{self, document_from_node, window_from_node, CloneChildrenFlag};
-use crate::dom::node::{LayoutNodeHelpers, Node, NodeDamage, NodeFlags, ShadowIncluding};
+use crate::dom::node::{Node, NodeDamage, NodeFlags, ShadowIncluding};
 use crate::dom::nodeiterator::NodeIterator;
 use crate::dom::nodelist::NodeList;
 use crate::dom::pagetransitionevent::PageTransitionEvent;
@@ -133,7 +135,8 @@ use percent_encoding::percent_decode;
 use profile_traits::ipc as profile_ipc;
 use profile_traits::time::{TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType};
 use ref_slice::ref_slice;
-use script_layout_interface::message::{Msg, ReflowGoal};
+use script_layout_interface::message::{Msg, PendingRestyle, ReflowGoal};
+use script_layout_interface::TrustedNodeAddress;
 use script_traits::{AnimationState, DocumentActivity, MouseButton, MouseEventType};
 use script_traits::{
     MsDuration, ScriptMsg, TouchEventType, TouchId, UntrustedNodeAddress, WheelDelta,
@@ -157,7 +160,7 @@ use style::attr::AttrValue;
 use style::context::QuirksMode;
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::media_queries::{Device, MediaType};
-use style::selector_parser::{RestyleDamage, Snapshot};
+use style::selector_parser::Snapshot;
 use style::shared_lock::SharedRwLock as StyleSharedRwLock;
 use style::str::{split_html_space_chars, str_join};
 use style::stylesheet_set::DocumentStylesheetSet;
@@ -199,29 +202,6 @@ impl FireMouseEventType {
 pub enum IsHTMLDocument {
     HTMLDocument,
     NonHTMLDocument,
-}
-
-#[derive(Debug, MallocSizeOf)]
-pub struct PendingRestyle {
-    /// If this element had a state or attribute change since the last restyle, track
-    /// the original condition of the element.
-    pub snapshot: Option<Snapshot>,
-
-    /// Any explicit restyles hints that have been accumulated for this element.
-    pub hint: RestyleHint,
-
-    /// Any explicit restyles damage that have been accumulated for this element.
-    pub damage: RestyleDamage,
-}
-
-impl PendingRestyle {
-    pub fn new() -> Self {
-        PendingRestyle {
-            snapshot: None,
-            hint: RestyleHint::empty(),
-            damage: RestyleDamage::empty(),
-        }
-    }
 }
 
 /// <https://dom.spec.whatwg.org/#document>
@@ -402,6 +382,13 @@ pub struct Document {
     csp_list: DomRefCell<Option<CspList>>,
     /// https://w3c.github.io/slection-api/#dfn-selection
     selection: MutNullableDom<Selection>,
+    /// A timeline for animations which is used for synchronizing animations.
+    /// https://drafts.csswg.org/web-animations/#timeline
+    animation_timeline: DomRefCell<AnimationTimeline>,
+    /// Animations for this Document
+    animations: DomRefCell<Animations>,
+    /// The nearest inclusive ancestors to all the nodes that require a restyle.
+    dirty_root: MutNullableDom<Element>,
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -461,6 +448,112 @@ enum ElementLookupResult {
 
 #[allow(non_snake_case)]
 impl Document {
+    pub fn note_node_with_dirty_descendants(&self, node: &Node) {
+        debug_assert!(*node.owner_doc() == *self);
+        if !node.is_connected() {
+            return;
+        }
+
+        let parent = match node.inclusive_ancestors(ShadowIncluding::Yes).nth(1) {
+            Some(parent) => parent,
+            None => {
+                // There is no parent so this is the Document node, so we
+                // behave as if we were called with the document element.
+                let document_element = match self.GetDocumentElement() {
+                    Some(element) => element,
+                    None => return,
+                };
+                if let Some(dirty_root) = self.dirty_root.get() {
+                    // There was an existing dirty root so we mark its
+                    // ancestors as dirty until the document element.
+                    for ancestor in dirty_root
+                        .upcast::<Node>()
+                        .inclusive_ancestors(ShadowIncluding::Yes)
+                    {
+                        if ancestor.is::<Element>() {
+                            ancestor.set_flag(NodeFlags::HAS_DIRTY_DESCENDANTS, true);
+                        }
+                    }
+                }
+                self.dirty_root.set(Some(&document_element));
+                return;
+            },
+        };
+
+        if parent.is::<Element>() {
+            if !parent.is_styled() {
+                return;
+            }
+
+            if parent.is_display_none() {
+                return;
+            }
+        }
+
+        let element_parent: DomRoot<Element>;
+        let element = match node.downcast::<Element>() {
+            Some(element) => element,
+            None => {
+                // Current node is not an element, it's probably a text node,
+                // we try to get its element parent.
+                match DomRoot::downcast::<Element>(parent) {
+                    Some(parent) => {
+                        element_parent = parent;
+                        &element_parent
+                    },
+                    None => {
+                        // Parent is not an element so it must be a document,
+                        // and this is not an element either, so there is
+                        // nothing to do.
+                        return;
+                    },
+                }
+            },
+        };
+
+        let dirty_root = match self.dirty_root.get() {
+            None => {
+                element
+                    .upcast::<Node>()
+                    .set_flag(NodeFlags::HAS_DIRTY_DESCENDANTS, true);
+                self.dirty_root.set(Some(element));
+                return;
+            },
+            Some(root) => root,
+        };
+
+        for ancestor in element
+            .upcast::<Node>()
+            .inclusive_ancestors(ShadowIncluding::Yes)
+        {
+            if ancestor.get_flag(NodeFlags::HAS_DIRTY_DESCENDANTS) {
+                return;
+            }
+            if ancestor.is::<Element>() {
+                ancestor.set_flag(NodeFlags::HAS_DIRTY_DESCENDANTS, true);
+            }
+        }
+
+        let new_dirty_root = element
+            .upcast::<Node>()
+            .common_ancestor(dirty_root.upcast(), ShadowIncluding::Yes);
+
+        let mut has_dirty_descendants = true;
+        for ancestor in dirty_root
+            .upcast::<Node>()
+            .inclusive_ancestors(ShadowIncluding::Yes)
+        {
+            ancestor.set_flag(NodeFlags::HAS_DIRTY_DESCENDANTS, has_dirty_descendants);
+            has_dirty_descendants &= *ancestor != *new_dirty_root;
+        }
+        self.dirty_root
+            .set(Some(new_dirty_root.downcast::<Element>().unwrap()));
+    }
+
+    pub fn take_dirty_root(&self) -> Option<DomRoot<Element>> {
+        self.dirty_root.take()
+    }
+
     #[inline]
     pub fn loader(&self) -> Ref<DocumentLoader> {
         self.loader.borrow()
@@ -590,10 +683,25 @@ impl Document {
 
     // https://html.spec.whatwg.org/multipage/#fallback-base-url
     pub fn fallback_base_url(&self) -> ServoUrl {
-        // Step 1: iframe srcdoc (#4767).
-        // Step 2: about:blank with a creator browsing context.
-        // Step 3.
-        self.url()
+        let document_url = self.url();
+        if let Some(browsing_context) = self.browsing_context() {
+            // Step 1: If document is an iframe srcdoc document, then return the
+            // document base URL of document's browsing context's container document.
+            let container_base_url = browsing_context
+                .parent()
+                .and_then(|parent| parent.document())
+                .map(|document| document.base_url());
+            if document_url.as_str() == "about:srcdoc" && container_base_url.is_some() {
+                return container_base_url.unwrap();
+            }
+            // Step 2: If document's URL is about:blank, and document's browsing
+            // context's creator base URL is non-null, then return that creator base URL.
+            if document_url.as_str() == "about:blank" && browsing_context.has_creator_base_url() {
+                return browsing_context.creator_base_url().unwrap();
+            }
+        }
+        // Step 3: Return document's URL.
+        document_url
     }
 
     // https://html.spec.whatwg.org/multipage/#document-base-url
@@ -610,16 +718,28 @@ impl Document {
         self.needs_paint.get()
     }
 
-    pub fn needs_reflow(&self) -> bool {
+    pub fn needs_reflow(&self) -> Option<ReflowTriggerCondition> {
         // FIXME: This should check the dirty bit on the document,
         // not the document element. Needs some layout changes to make
         // that workable.
-        self.stylesheets.borrow().has_changed() ||
-            self.GetDocumentElement().map_or(false, |root| {
-                root.upcast::<Node>().has_dirty_descendants() ||
-                    !self.pending_restyles.borrow().is_empty() ||
-                    self.needs_paint()
-            })
+        if self.stylesheets.borrow().has_changed() {
+            return Some(ReflowTriggerCondition::StylesheetsChanged);
+        }
+
+        let root = self.GetDocumentElement()?;
+        if root.upcast::<Node>().has_dirty_descendants() {
+            return Some(ReflowTriggerCondition::DirtyDescendants);
+        }
+
+        if !self.pending_restyles.borrow().is_empty() {
+            return Some(ReflowTriggerCondition::PendingRestyles);
+        }
+
+        if self.needs_paint() {
+            return Some(ReflowTriggerCondition::PaintPostponed);
+        }
+
+        None
     }
 
     /// Returns the first `base` element in the DOM that has an `href` attribute.
@@ -944,6 +1064,14 @@ impl Document {
     pub fn title_changed(&self) {
         if self.browsing_context().is_some() {
             self.send_title_to_embedder();
+            let global = self.window.upcast::<GlobalScope>();
+            if let Some(ref chan) = global.devtools_chan() {
+                let title = String::from(self.Title());
+                let _ = chan.send(ScriptToDevtoolsControlMsg::TitleChanged(
+                    global.pipeline_id(),
+                    title,
+                ));
+            }
         }
     }
 
@@ -962,8 +1090,14 @@ impl Document {
     }
 
     pub fn dirty_all_nodes(&self) {
-        let root = self.upcast::<Node>();
-        for node in root.traverse_preorder(ShadowIncluding::Yes) {
+        let root = match self.GetDocumentElement() {
+            Some(root) => root,
+            None => return,
+        };
+        for node in root
+            .upcast::<Node>()
+            .traverse_preorder(ShadowIncluding::Yes)
+        {
             node.dirty(NodeDamage::OtherNodeDamage)
         }
     }
@@ -1705,7 +1839,7 @@ impl Document {
             // is considered spurious, we need to ensure that the layout
             // and compositor *do* tick the animation.
             self.window
-                .force_reflow(ReflowGoal::Full, ReflowReason::RequestAnimationFrame);
+                .force_reflow(ReflowGoal::Full, ReflowReason::RequestAnimationFrame, None);
         }
 
         // Only send the animation change state message after running any callbacks.
@@ -1753,6 +1887,7 @@ impl Document {
         fetch_target: IpcSender<FetchResponseMsg>,
     ) {
         request.csp_list = self.get_csp_list().map(|x| x.clone());
+        request.https_state = self.https_state.get();
         let mut loader = self.loader.borrow_mut();
         loader.fetch_async(load, request, fetch_target);
     }
@@ -2627,78 +2762,67 @@ pub enum DocumentSource {
 }
 
 #[allow(unsafe_code)]
-pub trait LayoutDocumentHelpers {
-    unsafe fn is_html_document_for_layout(&self) -> bool;
-    unsafe fn drain_pending_restyles(&self) -> Vec<(LayoutDom<Element>, PendingRestyle)>;
-    unsafe fn needs_paint_from_layout(&self);
-    unsafe fn will_paint(&self);
-    unsafe fn quirks_mode(&self) -> QuirksMode;
-    unsafe fn style_shared_lock(&self) -> &StyleSharedRwLock;
-    unsafe fn shadow_roots(&self) -> Vec<LayoutDom<ShadowRoot>>;
-    unsafe fn shadow_roots_styles_changed(&self) -> bool;
-    unsafe fn flush_shadow_roots_stylesheets(&self);
+pub trait LayoutDocumentHelpers<'dom> {
+    fn is_html_document_for_layout(self) -> bool;
+    unsafe fn needs_paint_from_layout(self);
+    unsafe fn will_paint(self);
+    fn quirks_mode(self) -> QuirksMode;
+    fn style_shared_lock(self) -> &'dom StyleSharedRwLock;
+    fn shadow_roots(self) -> Vec<LayoutDom<'dom, ShadowRoot>>;
+    fn shadow_roots_styles_changed(self) -> bool;
+    unsafe fn flush_shadow_roots_stylesheets(self);
 }
 
 #[allow(unsafe_code)]
-impl LayoutDocumentHelpers for LayoutDom<Document> {
+impl<'dom> LayoutDocumentHelpers<'dom> for LayoutDom<'dom, Document> {
     #[inline]
-    unsafe fn is_html_document_for_layout(&self) -> bool {
-        (*self.unsafe_get()).is_html_document
+    fn is_html_document_for_layout(self) -> bool {
+        unsafe { self.unsafe_get().is_html_document }
     }
 
     #[inline]
-    #[allow(unrooted_must_root)]
-    unsafe fn drain_pending_restyles(&self) -> Vec<(LayoutDom<Element>, PendingRestyle)> {
-        let mut elements = (*self.unsafe_get())
-            .pending_restyles
-            .borrow_mut_for_layout();
-        // Elements were in a document when they were added to this list, but that
-        // may no longer be true when the next layout occurs.
-        let result = elements
-            .drain()
-            .map(|(k, v)| (k.to_layout(), v))
-            .filter(|&(ref k, _)| k.upcast::<Node>().get_flag(NodeFlags::IS_CONNECTED))
-            .collect();
-        result
-    }
-
-    #[inline]
-    unsafe fn needs_paint_from_layout(&self) {
+    unsafe fn needs_paint_from_layout(self) {
         (*self.unsafe_get()).needs_paint.set(true)
     }
 
     #[inline]
-    unsafe fn will_paint(&self) {
+    unsafe fn will_paint(self) {
         (*self.unsafe_get()).needs_paint.set(false)
     }
 
     #[inline]
-    unsafe fn quirks_mode(&self) -> QuirksMode {
-        (*self.unsafe_get()).quirks_mode()
+    fn quirks_mode(self) -> QuirksMode {
+        unsafe { self.unsafe_get().quirks_mode.get() }
     }
 
     #[inline]
-    unsafe fn style_shared_lock(&self) -> &StyleSharedRwLock {
-        (*self.unsafe_get()).style_shared_lock()
+    fn style_shared_lock(self) -> &'dom StyleSharedRwLock {
+        unsafe { self.unsafe_get().style_shared_lock() }
     }
 
     #[inline]
-    unsafe fn shadow_roots(&self) -> Vec<LayoutDom<ShadowRoot>> {
-        (*self.unsafe_get())
-            .shadow_roots
-            .borrow_for_layout()
-            .iter()
-            .map(|sr| sr.to_layout())
-            .collect()
+    fn shadow_roots(self) -> Vec<LayoutDom<'dom, ShadowRoot>> {
+        // FIXME(nox): We should just return a
+        // &'dom HashSet<LayoutDom<'dom, ShadowRoot>> here but not until
+        // I rework the ToLayout trait as mentioned in
+        // LayoutDom::to_layout_slice.
+        unsafe {
+            self.unsafe_get()
+                .shadow_roots
+                .borrow_for_layout()
+                .iter()
+                .map(|sr| sr.to_layout())
+                .collect()
+        }
     }
 
     #[inline]
-    unsafe fn shadow_roots_styles_changed(&self) -> bool {
-        (*self.unsafe_get()).shadow_roots_styles_changed()
+    fn shadow_roots_styles_changed(self) -> bool {
+        unsafe { self.unsafe_get().shadow_roots_styles_changed.get() }
     }
 
     #[inline]
-    unsafe fn flush_shadow_roots_stylesheets(&self) {
+    unsafe fn flush_shadow_roots_stylesheets(self) {
         (*self.unsafe_get()).flush_shadow_roots_stylesheets()
     }
 }
@@ -2917,6 +3041,13 @@ impl Document {
             dirty_webgl_contexts: DomRefCell::new(HashMap::new()),
             csp_list: DomRefCell::new(None),
             selection: MutNullableDom::new(None),
+            animation_timeline: if pref!(layout.animations.test.enabled) {
+                DomRefCell::new(AnimationTimeline::new_for_testing())
+            } else {
+                DomRefCell::new(AnimationTimeline::new())
+            },
+            animations: DomRefCell::new(Animations::new()),
+            dirty_root: Default::default(),
         }
     }
 
@@ -3200,7 +3331,7 @@ impl Document {
     pub fn element_state_will_change(&self, el: &Element) {
         let mut entry = self.ensure_pending_restyle(el);
         if entry.snapshot.is_none() {
-            entry.snapshot = Some(Snapshot::new(el.html_element_in_html_document()));
+            entry.snapshot = Some(Snapshot::new());
         }
         let snapshot = entry.snapshot.as_mut().unwrap();
         if snapshot.state.is_none() {
@@ -3216,7 +3347,7 @@ impl Document {
         // could in theory do it in the DOM I think.
         let mut entry = self.ensure_pending_restyle(el);
         if entry.snapshot.is_none() {
-            entry.snapshot = Some(Snapshot::new(el.html_element_in_html_document()));
+            entry.snapshot = Some(Snapshot::new());
         }
         if attr.local_name() == &local_name!("style") {
             entry.hint.insert(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
@@ -3228,11 +3359,20 @@ impl Document {
 
         let snapshot = entry.snapshot.as_mut().unwrap();
         if attr.local_name() == &local_name!("id") {
+            if snapshot.id_changed {
+                return;
+            }
             snapshot.id_changed = true;
         } else if attr.local_name() == &local_name!("class") {
+            if snapshot.class_changed {
+                return;
+            }
             snapshot.class_changed = true;
         } else {
             snapshot.other_attributes_changed = true;
+        }
+        if !snapshot.changed_attrs.contains(attr.local_name()) {
+            snapshot.changed_attrs.push(attr.local_name().clone());
         }
         if snapshot.attrs.is_none() {
             let attrs = el
@@ -3602,6 +3742,58 @@ impl Document {
             (None, None) => ElementLookupResult::None,
         }
     }
+
+    #[allow(unrooted_must_root)]
+    pub fn drain_pending_restyles(&self) -> Vec<(TrustedNodeAddress, PendingRestyle)> {
+        self.pending_restyles
+            .borrow_mut()
+            .drain()
+            .filter_map(|(elem, restyle)| {
+                let node = elem.upcast::<Node>();
+                if !node.get_flag(NodeFlags::IS_CONNECTED) {
+                    return None;
+                }
+                node.note_dirty_descendants();
+                Some((node.to_trusted_node_address(), restyle))
+            })
+            .collect()
+    }
+
+    pub(crate) fn advance_animation_timeline_for_testing(&self, delta: f64) {
+        self.animation_timeline.borrow_mut().advance_specific(delta);
+        let current_timeline_value = self.current_animation_timeline_value();
+        self.animations
+            .borrow()
+            .update_for_new_timeline_value(&self.window, current_timeline_value);
+    }
+
+    pub(crate) fn update_animation_timeline(&self) {
+        // Only update the time if it isn't being managed by a test.
+        if !pref!(layout.animations.test.enabled) {
+            self.animation_timeline.borrow_mut().update();
+        }
+
+        // We still want to update the animations, because our timeline
+        // value might have been advanced previously via the TestBinding.
+        let current_timeline_value = self.current_animation_timeline_value();
+        self.animations
+            .borrow()
+            .update_for_new_timeline_value(&self.window, current_timeline_value);
+    }
+
+    pub(crate) fn current_animation_timeline_value(&self) -> f64 {
+        self.animation_timeline.borrow().current_value()
+    }
+
+    pub(crate) fn animations(&self) -> Ref<Animations> {
+        self.animations.borrow()
+    }
+
+    pub(crate) fn update_animations_post_reflow(&self) {
+        self.animations
+            .borrow()
+            .do_post_reflow_update(&self.window, self.current_animation_timeline_value());
+    }
 }
 
 impl Element {
@@ -3631,6 +3823,11 @@ impl ProfilerMetadataFactory for Document {
 }
 
 impl DocumentMethods for Document {
+    // https://w3c.github.io/editing/ActiveDocuments/execCommand.html#querycommandsupported()
+    fn QueryCommandSupported(&self, _command: DOMString) -> bool {
+        false
+    }
+
     // https://drafts.csswg.org/cssom/#dom-document-stylesheets
     fn StyleSheets(&self) -> DomRoot<StyleSheetList> {
         self.stylesheet_list.or_init(|| {
@@ -4089,29 +4286,6 @@ impl DocumentMethods for Document {
         filter: Option<Rc<NodeFilter>>,
     ) -> DomRoot<NodeIterator> {
         NodeIterator::new(self, root, what_to_show, filter)
-    }
-
-    // https://w3c.github.io/touch-events/#idl-def-Document
-    fn CreateTouch(
-        &self,
-        window: &Window,
-        target: &EventTarget,
-        identifier: i32,
-        page_x: Finite<f64>,
-        page_y: Finite<f64>,
-        screen_x: Finite<f64>,
-        screen_y: Finite<f64>,
-    ) -> DomRoot<Touch> {
-        let client_x = Finite::wrap(*page_x - window.PageXOffset() as f64);
-        let client_y = Finite::wrap(*page_y - window.PageYOffset() as f64);
-        Touch::new(
-            window, identifier, target, screen_x, screen_y, client_x, client_y, page_x, page_y,
-        )
-    }
-
-    // https://w3c.github.io/touch-events/#idl-def-document-createtouchlist(touch...)
-    fn CreateTouchList(&self, touches: &[&Touch]) -> DomRoot<TouchList> {
-        TouchList::new(&self.window, &touches)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createtreewalker
@@ -4705,14 +4879,10 @@ impl DocumentMethods for Document {
         url: USVString,
         target: DOMString,
         features: DOMString,
-    ) -> Fallible<DomRoot<WindowProxy>> {
-        // WhatWG spec states this should always return a WindowProxy, but the spec for WindowProxy.open states
-        // it optionally returns a WindowProxy. Assume an error if window.open returns none.
-        // See https://github.com/whatwg/html/issues/4091
-        let context = self.browsing_context().ok_or(Error::InvalidAccess)?;
-        context
+    ) -> Fallible<Option<DomRoot<WindowProxy>>> {
+        self.browsing_context()
+            .ok_or(Error::InvalidAccess)?
             .open(url, target, features)
-            .ok_or(Error::InvalidAccess)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-document-write
@@ -5005,4 +5175,12 @@ impl PendingScript {
             .take()
             .map(|result| (DomRoot::from_ref(&*self.element), result))
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ReflowTriggerCondition {
+    StylesheetsChanged,
+    DirtyDescendants,
+    PendingRestyles,
+    PaintPostponed,
 }

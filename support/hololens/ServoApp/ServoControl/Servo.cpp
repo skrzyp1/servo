@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Servo.h"
+#include <EGL/egl.h>
 
 namespace winrt::servo {
 
@@ -21,10 +22,6 @@ void on_url_changed(const char *url) {
   sServo->Delegate().OnServoURLChanged(char2hstring(url));
 }
 
-void flush() { sServo->Delegate().Flush(); }
-
-void make_current() { sServo->Delegate().MakeCurrent(); }
-
 void wakeup() { sServo->Delegate().WakeUp(); }
 
 bool on_allow_navigation(const char *url) {
@@ -36,6 +33,10 @@ void on_animating_changed(bool aAnimating) {
 }
 
 void on_panic(const char *backtrace) {
+  if (sLogHandle != INVALID_HANDLE_VALUE) {
+    CloseHandle(sLogHandle);
+    sLogHandle = INVALID_HANDLE_VALUE;
+  }
   throw hresult_error(E_FAIL, char2hstring(backtrace));
 }
 
@@ -43,7 +44,7 @@ void on_ime_state_changed(bool aShow) {
   sServo->Delegate().OnServoIMEStateChanged(aShow);
 }
 
-void set_clipboard_contents(const char *content) {
+void set_clipboard_contents(const char *) {
   // FIXME
 }
 
@@ -60,17 +61,47 @@ void on_media_session_metadata(const char *title, const char *album,
 
 void on_media_session_playback_state_change(
     const capi::CMediaSessionPlaybackState state) {
-  return sServo->Delegate().OnServoMediaSessionPlaybackStateChange(state);
+  return sServo->Delegate().OnServoMediaSessionPlaybackStateChange(static_cast<int>(state));
 }
 
 void prompt_alert(const char *message, bool trusted) {
   sServo->Delegate().OnServoPromptAlert(char2hstring(message), trusted);
 }
 
+void show_context_menu(const char *title, const char *const *items_list,
+                       uint32_t items_size) {
+  std::optional<hstring> opt_title = {};
+  if (title != nullptr) {
+    opt_title = char2hstring(title);
+  }
+  std::vector<winrt::hstring> items;
+  for (uint32_t i = 0; i < items_size; i++) {
+    items.push_back(char2hstring(items_list[i]));
+  }
+  sServo->Delegate().OnServoShowContextMenu(opt_title, items);
+}
+
 void on_devtools_started(Servo::DevtoolsServerState result,
                          const unsigned int port) {
   sServo->Delegate().OnServoDevtoolsStarted(
       result == Servo::DevtoolsServerState::Started, port);
+}
+
+void on_log_output(const char *buffer, uint32_t buffer_length) {
+  OutputDebugStringA(buffer);
+
+  if (sLogHandle == INVALID_HANDLE_VALUE) {
+    return;
+  }
+
+  DWORD bytesWritten;
+  auto writeResult =
+      WriteFile(sLogHandle, buffer, buffer_length, &bytesWritten, nullptr);
+
+  if (writeResult == FALSE || bytesWritten != buffer_length)
+    throw std::runtime_error(
+        "Failed to write log message to the log file: error code " +
+        std::to_string(GetLastError()));
 }
 
 Servo::PromptResult prompt_ok_cancel(const char *message, bool trusted) {
@@ -94,8 +125,10 @@ const char *prompt_input(const char *message, const char *default,
 }
 
 Servo::Servo(hstring url, hstring args, GLsizei width, GLsizei height,
-             float dpi, ServoDelegate &aDelegate)
+             EGLNativeWindowType eglNativeWindow, float dpi,
+             ServoDelegate &aDelegate)
     : mWindowHeight(height), mWindowWidth(width), mDelegate(aDelegate) {
+  SetEnvironmentVariableA("PreviewRuntimeEnabled", "1");
 
   capi::CInitOptions o;
   hstring defaultPrefs = L" --pref dom.webxr.enabled --devtools";
@@ -105,36 +138,56 @@ Servo::Servo(hstring url, hstring args, GLsizei width, GLsizei height,
   o.height = mWindowHeight;
   o.density = dpi;
   o.enable_subpixel_text_antialiasing = false;
-  o.vr_pointer = NULL;
+  o.native_widget = eglNativeWindow;
 
-  // 7 filter modules.
-  /* Sample list of servo modules to filter.
-  static char *pfilters[] = {
-          "servo",
-          "simpleservo",
-          "simpleservo::jniapi",
-          "simpleservo::gl_glue::egl",
-          // Show JS errors by default.
-          "script::dom::bindings::error",
-          // Show GL errors by default.
-          "canvas::webgl_thread",
-          "compositing::compositor",
-          "constellation::constellation",
-  };
-  */
+  // Note about logs:
+  // By default: all modules are enabled. Only warn level-logs are displayed.
+  // To change the log level, add "--vslogger-level debug" to o.args.
+  // To only print logs from specific modules, add their names to pfilters.
+  // For example:
+  // static char *pfilters[] = {
+  //   "servo",
+  //   "simpleservo",
+  //   "script::dom::bindings::error", // Show JS errors by default.
+  //   "canvas::webgl_thread", // Show GL errors by default.
+  //   "compositing",
+  //   "constellation",
+  // };
+  // o.vslogger_mod_list = pfilters;
+  // o.vslogger_mod_size = sizeof(pfilters) / sizeof(pfilters[0]);
 
-  // Example Call when *pfilters[] is used:
-  // o.vslogger_mod_list = pfilters; // servo log modules
-  // o.vslogger_mod_size = sizeof(pfilters) / sizeof(pfilters[0]); //
-  // Important: Number of modules in pfilters
   o.vslogger_mod_list = NULL;
   o.vslogger_mod_size = 0;
 
   sServo = this; // FIXME;
 
+#ifndef _DEBUG
+  char buffer[1024];
+  bool logToFile = GetEnvironmentVariableA("FirefoxRealityLogStdout", buffer,
+                                           sizeof(buffer)) != 0;
+#else
+  bool logToFile = true;
+#endif
+  if (logToFile) {
+    auto current = winrt::Windows::Storage::ApplicationData::Current();
+    auto filePath =
+        std::wstring(current.LocalFolder().Path()) + L"\\stdout.txt";
+    sLogHandle =
+        CreateFile2(filePath.c_str(), GENERIC_WRITE, 0, CREATE_ALWAYS, nullptr);
+    if (sLogHandle == INVALID_HANDLE_VALUE) {
+      throw std::runtime_error("Failed to open the log file: error code " +
+                               std::to_string(GetLastError()));
+    }
+
+    if (SetFilePointer(sLogHandle, 0, nullptr, FILE_END) ==
+        INVALID_SET_FILE_POINTER) {
+      throw std::runtime_error(
+          "Failed to set file pointer to the end of file: error code " +
+          std::to_string(GetLastError()));
+    }
+  }
+
   capi::CHostCallbacks c;
-  c.flush = &flush;
-  c.make_current = &make_current;
   c.on_load_started = &on_load_started;
   c.on_load_ended = &on_load_ended;
   c.on_title_changed = &on_title_changed;
@@ -154,13 +207,19 @@ Servo::Servo(hstring url, hstring args, GLsizei width, GLsizei height,
   c.prompt_yes_no = &prompt_yes_no;
   c.prompt_input = &prompt_input;
   c.on_devtools_started = &on_devtools_started;
+  c.show_context_menu = &show_context_menu;
+  c.on_log_output = &on_log_output;
 
   capi::register_panic_handler(&on_panic);
 
   capi::init_with_egl(o, &wakeup, c);
 }
 
-Servo::~Servo() { sServo = nullptr; }
+Servo::~Servo() {
+  sServo = nullptr;
+  if (sLogHandle != INVALID_HANDLE_VALUE)
+    CloseHandle(sLogHandle);
+}
 
 winrt::hstring char2hstring(const char *c_str) {
   // FIXME: any better way of doing this?

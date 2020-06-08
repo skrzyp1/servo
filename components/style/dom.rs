@@ -8,21 +8,20 @@
 #![deny(missing_docs)]
 
 use crate::applicable_declarations::ApplicableDeclarationBlock;
+use crate::context::SharedStyleContext;
 #[cfg(feature = "gecko")]
-use crate::context::PostAnimationTasks;
-#[cfg(feature = "gecko")]
-use crate::context::UpdateAnimationsTasks;
+use crate::context::{PostAnimationTasks, UpdateAnimationsTasks};
 use crate::data::ElementData;
 use crate::element_state::ElementState;
 use crate::font_metrics::FontMetricsProvider;
 use crate::media_queries::Device;
 use crate::properties::{AnimationRules, ComputedValues, PropertyDeclarationBlock};
 use crate::selector_parser::{AttrValue, Lang, PseudoElement, SelectorImpl};
-use crate::shared_lock::Locked;
+use crate::shared_lock::{Locked, SharedRwLock};
 use crate::stylist::CascadeData;
 use crate::traversal_flags::TraversalFlags;
 use crate::{Atom, LocalName, Namespace, WeakAtom};
-use atomic_refcell::{AtomicRef, AtomicRefCell, AtomicRefMut};
+use atomic_refcell::{AtomicRef, AtomicRefMut};
 use selectors::matching::{ElementSelectorFlags, QuirksMode, VisitedHandlingMode};
 use selectors::sink::Push;
 use selectors::Element as SelectorsElement;
@@ -129,6 +128,9 @@ pub trait TDocument: Sized + Copy + Clone {
     {
         Err(())
     }
+
+    /// This document's shared lock.
+    fn shared_lock(&self) -> &SharedRwLock;
 }
 
 /// The `TNode` trait. This is the main generic trait over which the style
@@ -522,6 +524,14 @@ pub trait TElement:
     {
     }
 
+    /// Internal iterator for the part names that this element exports for a
+    /// given part name.
+    fn each_exported_part<F>(&self, _name: &Atom, _callback: F)
+    where
+        F: FnMut(&Atom),
+    {
+    }
+
     /// Whether a given element may generate a pseudo-element.
     ///
     /// This is useful to avoid computing, for example, pseudo styles for
@@ -689,18 +699,14 @@ pub trait TElement:
     /// Unsafe following the same reasoning as ensure_data.
     unsafe fn clear_data(&self);
 
-    /// Gets a reference to the ElementData container.
-    fn get_data(&self) -> Option<&AtomicRefCell<ElementData>>;
+    /// Whether there is an ElementData container.
+    fn has_data(&self) -> bool;
 
     /// Immutably borrows the ElementData.
-    fn borrow_data(&self) -> Option<AtomicRef<ElementData>> {
-        self.get_data().map(|x| x.borrow())
-    }
+    fn borrow_data(&self) -> Option<AtomicRef<ElementData>>;
 
     /// Mutably borrows the ElementData.
-    fn mutate_data(&self) -> Option<AtomicRefMut<ElementData>> {
-        self.get_data().map(|x| x.borrow_mut())
-    }
+    fn mutate_data(&self) -> Option<AtomicRefMut<ElementData>>;
 
     /// Whether we should skip any root- or item-based display property
     /// blockification on this element.  (This function exists so that Gecko
@@ -745,7 +751,7 @@ pub trait TElement:
     fn has_animations(&self) -> bool;
 
     /// Returns true if the element has a CSS animation.
-    fn has_css_animations(&self) -> bool;
+    fn has_css_animations(&self, context: &SharedStyleContext) -> bool;
 
     /// Returns true if the element has a CSS transition (including running transitions and
     /// completed transitions).

@@ -32,28 +32,31 @@
 
 use crate::data::{LayoutData, LayoutDataFlags, StyleAndLayoutData};
 use atomic_refcell::{AtomicRef, AtomicRefMut};
-use script_layout_interface::wrapper_traits::GetLayoutData;
+use script_layout_interface::wrapper_traits::GetStyleAndOpaqueLayoutData;
 use script_layout_interface::wrapper_traits::{ThreadSafeLayoutElement, ThreadSafeLayoutNode};
-use style::dom::{NodeInfo, TNode};
+use style::dom::{NodeInfo, TElement, TNode};
 use style::selector_parser::RestyleDamage;
 use style::values::computed::counters::ContentItem;
 use style::values::generics::counters::Content;
 
-pub trait LayoutNodeLayoutData {
-    /// Similar to borrow_data*, but returns the full PersistentLayoutData rather
-    /// than only the style::data::ElementData.
-    fn borrow_layout_data(&self) -> Option<AtomicRef<LayoutData>>;
-    fn mutate_layout_data(&self) -> Option<AtomicRefMut<LayoutData>>;
+pub trait LayoutNodeLayoutData<'dom> {
+    fn borrow_layout_data(self) -> Option<AtomicRef<'dom, LayoutData>>;
+    fn mutate_layout_data(self) -> Option<AtomicRefMut<'dom, LayoutData>>;
     fn flow_debug_id(self) -> usize;
 }
 
-impl<T: GetLayoutData> LayoutNodeLayoutData for T {
-    fn borrow_layout_data(&self) -> Option<AtomicRef<LayoutData>> {
-        self.get_raw_data().map(|d| d.layout_data.borrow())
+impl<'dom, T> LayoutNodeLayoutData<'dom> for T
+where
+    T: GetStyleAndOpaqueLayoutData<'dom>,
+{
+    fn borrow_layout_data(self) -> Option<AtomicRef<'dom, LayoutData>> {
+        self.get_style_and_layout_data()
+            .map(|d| d.layout_data.borrow())
     }
 
-    fn mutate_layout_data(&self) -> Option<AtomicRefMut<LayoutData>> {
-        self.get_raw_data().map(|d| d.layout_data.borrow_mut())
+    fn mutate_layout_data(self) -> Option<AtomicRefMut<'dom, LayoutData>> {
+        self.get_style_and_layout_data()
+            .map(|d| d.layout_data.borrow_mut())
     }
 
     fn flow_debug_id(self) -> usize {
@@ -62,16 +65,20 @@ impl<T: GetLayoutData> LayoutNodeLayoutData for T {
     }
 }
 
-pub trait GetRawData {
-    fn get_raw_data(&self) -> Option<&StyleAndLayoutData>;
+pub trait GetStyleAndLayoutData<'dom> {
+    fn get_style_and_layout_data(self) -> Option<StyleAndLayoutData<'dom>>;
 }
 
-impl<T: GetLayoutData> GetRawData for T {
-    fn get_raw_data(&self) -> Option<&StyleAndLayoutData> {
-        self.get_style_and_layout_data().map(|opaque| {
-            let container = opaque.ptr.as_ptr() as *mut StyleAndLayoutData;
-            unsafe { &*container }
-        })
+impl<'dom, T> GetStyleAndLayoutData<'dom> for T
+where
+    T: GetStyleAndOpaqueLayoutData<'dom>,
+{
+    fn get_style_and_layout_data(self) -> Option<StyleAndLayoutData<'dom>> {
+        self.get_style_and_opaque_layout_data()
+            .map(|data| StyleAndLayoutData {
+                style_data: &data.style_data,
+                layout_data: data.generic_data.downcast_ref().unwrap(),
+            })
     }
 }
 
@@ -98,7 +105,10 @@ pub trait ThreadSafeLayoutNodeHelpers {
     fn restyle_damage(self) -> RestyleDamage;
 }
 
-impl<T: ThreadSafeLayoutNode> ThreadSafeLayoutNodeHelpers for T {
+impl<'dom, T> ThreadSafeLayoutNodeHelpers for T
+where
+    T: ThreadSafeLayoutNode<'dom>,
+{
     fn flags(self) -> LayoutDataFlags {
         self.borrow_layout_data().as_ref().unwrap().flags
     }
@@ -121,7 +131,7 @@ impl<T: ThreadSafeLayoutNode> ThreadSafeLayoutNodeHelpers for T {
             });
         }
 
-        TextContent::Text(self.node_text_content().into_boxed_str())
+        TextContent::Text(self.node_text_content().into_owned().into_boxed_str())
     }
 
     fn restyle_damage(self) -> RestyleDamage {
@@ -138,7 +148,13 @@ impl<T: ThreadSafeLayoutNode> ThreadSafeLayoutNodeHelpers for T {
         }
 
         let damage = {
-            let data = node.get_raw_data().unwrap();
+            let data = match node.get_style_and_layout_data() {
+                Some(data) => data,
+                None => panic!(
+                    "could not get style and layout data for <{}>",
+                    node.as_element().unwrap().local_name()
+                ),
+            };
 
             if !data
                 .layout_data

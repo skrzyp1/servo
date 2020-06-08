@@ -266,15 +266,6 @@ pub trait GenericDrawTarget {
     );
     fn fill(&mut self, path: &Path, pattern: Pattern, draw_options: &DrawOptions);
     fn fill_rect(&mut self, rect: &Rect<f32>, pattern: Pattern, draw_options: Option<&DrawOptions>);
-    fn fill_text(
-        &mut self,
-        text: String,
-        x: f32,
-        y: f32,
-        max_width: Option<f64>,
-        pattern: Pattern,
-        draw_options: &DrawOptions,
-    );
     fn get_format(&self) -> SurfaceFormat;
     fn get_size(&self) -> Size2D<i32>;
     fn get_transform(&self) -> Transform2D<f32>;
@@ -377,6 +368,7 @@ pub struct CanvasData<'a> {
     state: CanvasPaintState<'a>,
     saved_states: Vec<CanvasPaintState<'a>>,
     webrender_api: webrender_api::RenderApi,
+    webrender_doc: webrender_api::DocumentId,
     image_key: Option<webrender_api::ImageKey>,
     /// An old webrender image key that can be deleted when the next epoch ends.
     old_image_key: Option<webrender_api::ImageKey>,
@@ -393,6 +385,7 @@ impl<'a> CanvasData<'a> {
     pub fn new(
         size: Size2D<u64>,
         webrender_api_sender: webrender_api::RenderApiSender,
+        webrender_doc: webrender_api::DocumentId,
         antialias: AntialiasMode,
         canvas_id: CanvasId,
     ) -> CanvasData<'a> {
@@ -406,6 +399,7 @@ impl<'a> CanvasData<'a> {
             state: CanvasPaintState::new(antialias),
             saved_states: vec![],
             webrender_api: webrender_api,
+            webrender_doc,
             image_key: None,
             old_image_key: None,
             very_old_image_key: None,
@@ -461,25 +455,16 @@ impl<'a> CanvasData<'a> {
 
     pub fn restore_context_state(&mut self) {
         if let Some(state) = self.saved_states.pop() {
-            mem::replace(&mut self.state, state);
+            let _ = mem::replace(&mut self.state, state);
             self.drawtarget.set_transform(&self.state.transform);
             self.drawtarget.pop_clip();
         }
     }
 
-    pub fn fill_text(&mut self, text: String, x: f64, y: f64, max_width: Option<f64>) {
-        // If any of the arguments are infinite or NaN, then return.
-        if !x.is_finite() || !y.is_finite() {
-            return;
-        }
-
-        self.drawtarget.fill_text(
-            text,
-            x as f32,
-            y as f32,
-            max_width,
-            self.state.fill_style.clone(),
-            &self.state.draw_options,
+    pub fn fill_text(&self, text: String, x: f64, y: f64, max_width: Option<f64>) {
+        error!(
+            "Unimplemented canvas2d.fillText. Values received: {}, {}, {}, {:?}.",
+            text, x, y, max_width
         );
     }
 
@@ -1014,7 +999,7 @@ impl<'a> CanvasData<'a> {
             txn.delete_image(image_key);
         }
 
-        self.webrender_api.update_resources(txn.resource_updates);
+        self.webrender_api.send_transaction(self.webrender_doc, txn);
 
         let data = CanvasImageData {
             image_key: self.image_key.unwrap(),
@@ -1075,7 +1060,7 @@ impl<'a> CanvasData<'a> {
             self.drawtarget.get_format(),
         );
         let matrix = Transform2D::identity()
-            .pre_translate(-source_rect.origin.to_vector().cast())
+            .pre_translate(-source_rect.origin.to_vector().cast::<f32>())
             .pre_transform(&self.state.transform);
         draw_target.set_transform(&matrix);
         draw_target
@@ -1134,7 +1119,7 @@ impl<'a> Drop for CanvasData<'a> {
             txn.delete_image(image_key);
         }
 
-        self.webrender_api.update_resources(txn.resource_updates);
+        self.webrender_api.send_transaction(self.webrender_doc, txn);
     }
 }
 
@@ -1213,22 +1198,6 @@ impl RectToi32 for Rect<f64> {
             Point2D::new(self.origin.x.ceil(), self.origin.y.ceil()),
             Size2D::new(self.size.width.ceil(), self.size.height.ceil()),
         )
-    }
-}
-
-pub trait Size2DExt {
-    fn to_u64(&self) -> Size2D<u64>;
-}
-
-impl Size2DExt for Size2D<f64> {
-    fn to_u64(&self) -> Size2D<u64> {
-        self.cast()
-    }
-}
-
-impl Size2DExt for Size2D<u32> {
-    fn to_u64(&self) -> Size2D<u64> {
-        self.cast()
     }
 }
 

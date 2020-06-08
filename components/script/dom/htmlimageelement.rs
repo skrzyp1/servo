@@ -18,11 +18,11 @@ use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomObject;
 use crate::dom::bindings::root::{DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
-use crate::dom::document::Document;
+use crate::dom::document::{determine_policy_for_token, Document};
 use crate::dom::element::{cors_setting_for_element, referrer_policy_for_element};
 use crate::dom::element::{reflect_cross_origin_attribute, set_cross_origin_attribute};
 use crate::dom::element::{
-    AttributeMutation, CustomElementCreationMode, Element, ElementCreator, RawLayoutElementHelpers,
+    AttributeMutation, CustomElementCreationMode, Element, ElementCreator, LayoutElementHelpers,
 };
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
@@ -43,7 +43,7 @@ use crate::dom::values::UNSIGNED_LONG_MAX;
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::dom::window::Window;
 use crate::fetch::create_a_potential_cors_request;
-use crate::image_listener::{add_cache_listener_for_element, ImageCacheListener};
+use crate::image_listener::{generate_cache_listener_for_element, ImageCacheListener};
 use crate::microtask::{Microtask, MicrotaskRunnable};
 use crate::network_listener::{self, NetworkListener, PreInvoke, ResourceTimingListener};
 use crate::script_thread::ScriptThread;
@@ -54,13 +54,15 @@ use dom_struct::dom_struct;
 use euclid::Point2D;
 use html5ever::{LocalName, Prefix, QualName};
 use ipc_channel::ipc;
+use ipc_channel::ipc::IpcSender;
 use ipc_channel::router::ROUTER;
 use mime::{self, Mime};
 use msg::constellation_msg::PipelineId;
 use net_traits::image::base::{Image, ImageMetadata};
-use net_traits::image_cache::UsePlaceholder;
-use net_traits::image_cache::{CanRequestImages, CorsStatus, ImageCache, ImageOrMetadataAvailable};
-use net_traits::image_cache::{ImageResponder, ImageResponse, ImageState, PendingImageId};
+use net_traits::image_cache::{
+    CorsStatus, ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponse,
+    PendingImageId, PendingImageResponse, UsePlaceholder,
+};
 use net_traits::request::{CorsSettings, Destination, Initiator, RequestBuilder};
 use net_traits::{FetchMetadata, FetchResponseListener, FetchResponseMsg, NetworkError};
 use net_traits::{ReferrerPolicy, ResourceFetchTiming, ResourceTimingType};
@@ -317,35 +319,34 @@ impl HTMLImageElement {
     fn fetch_image(&self, img_url: &ServoUrl) {
         let window = window_from_node(self);
         let image_cache = window.image_cache();
-        let response = image_cache.find_image_or_metadata(
-            img_url.clone().into(),
+        let sender = generate_cache_listener_for_element(self);
+        let cache_result = image_cache.track_image(
+            img_url.clone(),
             window.origin().immutable().clone(),
             cors_setting_for_element(self.upcast()),
+            sender,
             UsePlaceholder::Yes,
-            CanRequestImages::Yes,
         );
-        match response {
-            Ok(ImageOrMetadataAvailable::ImageAvailable(image, url)) => {
-                self.process_image_response(ImageResponse::Loaded(image, url));
-            },
 
-            Ok(ImageOrMetadataAvailable::MetadataAvailable(m)) => {
-                self.process_image_response(ImageResponse::MetadataLoaded(m));
+        match cache_result {
+            ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable {
+                image,
+                url,
+                is_placeholder,
+            }) => {
+                if is_placeholder {
+                    self.process_image_response(ImageResponse::PlaceholderLoaded(image, url))
+                } else {
+                    self.process_image_response(ImageResponse::Loaded(image, url))
+                }
             },
-
-            Err(ImageState::Pending(id)) => {
-                add_cache_listener_for_element(image_cache, id, self);
+            ImageCacheResult::Available(ImageOrMetadataAvailable::MetadataAvailable(m)) => {
+                self.process_image_response(ImageResponse::MetadataLoaded(m))
             },
-
-            Err(ImageState::LoadError) => {
-                self.process_image_response(ImageResponse::None);
-            },
-
-            Err(ImageState::NotRequested(id)) => {
-                add_cache_listener_for_element(image_cache, id, self);
-                self.fetch_request(img_url, id);
-            },
-        }
+            ImageCacheResult::Pending(_) => (),
+            ImageCacheResult::ReadyForRequest(id) => self.fetch_request(img_url, id),
+            ImageCacheResult::LoadError => self.process_image_response(ImageResponse::None),
+        };
     }
 
     fn fetch_request(&self, img_url: &ServoUrl, id: PendingImageId) {
@@ -943,14 +944,13 @@ impl HTMLImageElement {
         if let Some(src) = selected_source {
             if let Ok(img_url) = base_url.join(&src) {
                 let image_cache = window.image_cache();
-                let response = image_cache.find_image_or_metadata(
-                    img_url.clone().into(),
+                let response = image_cache.get_image(
+                    img_url.clone(),
                     window.origin().immutable().clone(),
                     cors_setting_for_element(self.upcast()),
-                    UsePlaceholder::No,
-                    CanRequestImages::No,
                 );
-                if let Ok(ImageOrMetadataAvailable::ImageAvailable(image, url)) = response {
+
+                if let Some(image) = response {
                     // Cancel any outstanding tasks that were queued before the src was
                     // set on this element.
                     self.generation.set(self.generation.get() + 1);
@@ -963,7 +963,7 @@ impl HTMLImageElement {
                     self.abort_request(State::CompletelyAvailable, ImageRequestPhase::Current);
                     self.abort_request(State::Unavailable, ImageRequestPhase::Pending);
                     let mut current_request = self.current_request.borrow_mut();
-                    current_request.final_url = Some(url);
+                    current_request.final_url = Some(img_url.clone());
                     current_request.image = Some(image.clone());
                     current_request.metadata = Some(metadata);
                     // Step 6.3.6
@@ -1010,13 +1010,12 @@ impl HTMLImageElement {
     /// Step 2-12 of https://html.spec.whatwg.org/multipage/#img-environment-changes
     fn react_to_environment_changes_sync_steps(&self, generation: u32) {
         // TODO reduce duplicacy of this code
-        fn add_cache_listener_for_element(
-            image_cache: Arc<dyn ImageCache>,
-            id: PendingImageId,
+
+        fn generate_cache_listener_for_element(
             elem: &HTMLImageElement,
             selected_source: String,
             selected_pixel_density: f64,
-        ) {
+        ) -> IpcSender<PendingImageResponse> {
             let trusted_node = Trusted::new(elem);
             let (responder_sender, responder_receiver) = ipc::channel().unwrap();
 
@@ -1025,27 +1024,30 @@ impl HTMLImageElement {
                 .task_manager()
                 .networking_task_source_with_canceller();
             let generation = elem.generation.get();
-            ROUTER.add_route(responder_receiver.to_opaque(), Box::new(move |message| {
-                debug!("Got image {:?}", message);
-                // Return the image via a message to the script thread, which marks
-                // the element as dirty and triggers a reflow.
-                let element = trusted_node.clone();
-                let image = message.to().unwrap();
-                let selected_source_clone = selected_source.clone();
-                let _ = task_source.queue_with_canceller(
-                    task!(process_image_response_for_environment_change: move || {
-                        let element = element.root();
-                        // Ignore any image response for a previous request that has been discarded.
-                        if generation == element.generation.get() {
-                            element.process_image_response_for_environment_change(image,
-                                USVString::from(selected_source_clone), generation, selected_pixel_density);
-                        }
-                    }),
-                    &canceller,
-                );
-            }));
+            ROUTER.add_route(
+                responder_receiver.to_opaque(),
+                Box::new(move |message| {
+                    debug!("Got image {:?}", message);
+                    // Return the image via a message to the script thread, which marks
+                    // the element as dirty and triggers a reflow.
+                    let element = trusted_node.clone();
+                    let image = message.to().unwrap();
+                    let selected_source_clone = selected_source.clone();
+                    let _ = task_source.queue_with_canceller(
+                        task!(process_image_response_for_environment_change: move || {
+                            let element = element.root();
+                            // Ignore any image response for a previous request that has been discarded.
+                            if generation == element.generation.get() {
+                                element.process_image_response_for_environment_change(image,
+                                    USVString::from(selected_source_clone), generation, selected_pixel_density);
+                            }
+                        }),
+                        &canceller,
+                    );
+                }),
+            );
 
-            image_cache.add_listener(id, ImageResponder::new(responder_sender, id));
+            responder_sender
         }
 
         let elem = self.upcast::<Element>();
@@ -1099,25 +1101,31 @@ impl HTMLImageElement {
 
         let window = window_from_node(self);
         let image_cache = window.image_cache();
+
         // Step 14
-        let response = image_cache.find_image_or_metadata(
-            img_url.clone().into(),
+        let sender = generate_cache_listener_for_element(
+            self,
+            selected_source.0.clone(),
+            selected_pixel_density,
+        );
+        let cache_result = image_cache.track_image(
+            img_url.clone(),
             window.origin().immutable().clone(),
             cors_setting_for_element(self.upcast()),
+            sender,
             UsePlaceholder::No,
-            CanRequestImages::Yes,
         );
-        match response {
-            Ok(ImageOrMetadataAvailable::ImageAvailable(_image, _url)) => {
+
+        match cache_result {
+            ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable { .. }) => {
                 // Step 15
                 self.finish_reacting_to_environment_change(
                     selected_source,
                     generation,
                     selected_pixel_density,
-                );
+                )
             },
-
-            Ok(ImageOrMetadataAvailable::MetadataAvailable(m)) => {
+            ImageCacheResult::Available(ImageOrMetadataAvailable::MetadataAvailable(m)) => {
                 self.process_image_response_for_environment_change(
                     ImageResponse::MetadataLoaded(m),
                     selected_source,
@@ -1125,18 +1133,7 @@ impl HTMLImageElement {
                     selected_pixel_density,
                 );
             },
-
-            Err(ImageState::Pending(id)) => {
-                add_cache_listener_for_element(
-                    image_cache.clone(),
-                    id,
-                    self,
-                    selected_source.0,
-                    selected_pixel_density,
-                );
-            },
-
-            Err(ImageState::LoadError) => {
+            ImageCacheResult::LoadError => {
                 self.process_image_response_for_environment_change(
                     ImageResponse::None,
                     selected_source,
@@ -1144,17 +1141,8 @@ impl HTMLImageElement {
                     selected_pixel_density,
                 );
             },
-
-            Err(ImageState::NotRequested(id)) => {
-                add_cache_listener_for_element(
-                    image_cache,
-                    id,
-                    self,
-                    selected_source.0,
-                    selected_pixel_density,
-                );
-                self.fetch_request(&img_url, id);
-            },
+            ImageCacheResult::ReadyForRequest(id) => self.fetch_request(&img_url, id),
+            ImageCacheResult::Pending(_) => (),
         }
     }
 
@@ -1366,79 +1354,56 @@ impl MicrotaskRunnable for ImageElementMicrotask {
 }
 
 pub trait LayoutHTMLImageElementHelpers {
-    #[allow(unsafe_code)]
-    unsafe fn image(&self) -> Option<Arc<Image>>;
-
-    #[allow(unsafe_code)]
-    unsafe fn image_url(&self) -> Option<ServoUrl>;
-
-    #[allow(unsafe_code)]
-    unsafe fn image_density(&self) -> Option<f64>;
-
-    #[allow(unsafe_code)]
-    unsafe fn image_data(&self) -> (Option<Arc<Image>>, Option<ImageMetadata>);
-
-    fn get_width(&self) -> LengthOrPercentageOrAuto;
-    fn get_height(&self) -> LengthOrPercentageOrAuto;
+    fn image(self) -> Option<Arc<Image>>;
+    fn image_url(self) -> Option<ServoUrl>;
+    fn image_density(self) -> Option<f64>;
+    fn image_data(self) -> (Option<Arc<Image>>, Option<ImageMetadata>);
+    fn get_width(self) -> LengthOrPercentageOrAuto;
+    fn get_height(self) -> LengthOrPercentageOrAuto;
 }
 
-impl LayoutHTMLImageElementHelpers for LayoutDom<HTMLImageElement> {
+impl<'dom> LayoutDom<'dom, HTMLImageElement> {
     #[allow(unsafe_code)]
-    unsafe fn image(&self) -> Option<Arc<Image>> {
-        (*self.unsafe_get())
-            .current_request
-            .borrow_for_layout()
-            .image
-            .clone()
+    fn current_request(self) -> &'dom ImageRequest {
+        unsafe { self.unsafe_get().current_request.borrow_for_layout() }
+    }
+}
+
+impl LayoutHTMLImageElementHelpers for LayoutDom<'_, HTMLImageElement> {
+    fn image(self) -> Option<Arc<Image>> {
+        self.current_request().image.clone()
     }
 
-    #[allow(unsafe_code)]
-    unsafe fn image_url(&self) -> Option<ServoUrl> {
-        (*self.unsafe_get())
-            .current_request
-            .borrow_for_layout()
-            .parsed_url
-            .clone()
+    fn image_url(self) -> Option<ServoUrl> {
+        self.current_request().parsed_url.clone()
     }
 
-    #[allow(unsafe_code)]
-    unsafe fn image_data(&self) -> (Option<Arc<Image>>, Option<ImageMetadata>) {
-        let current_request = (*self.unsafe_get()).current_request.borrow_for_layout();
+    fn image_data(self) -> (Option<Arc<Image>>, Option<ImageMetadata>) {
+        let current_request = self.current_request();
         (
             current_request.image.clone(),
             current_request.metadata.clone(),
         )
     }
 
-    #[allow(unsafe_code)]
-    unsafe fn image_density(&self) -> Option<f64> {
-        (*self.unsafe_get())
-            .current_request
-            .borrow_for_layout()
-            .current_pixel_density
-            .clone()
+    fn image_density(self) -> Option<f64> {
+        self.current_request().current_pixel_density.clone()
     }
 
-    #[allow(unsafe_code)]
-    fn get_width(&self) -> LengthOrPercentageOrAuto {
-        unsafe {
-            (*self.upcast::<Element>().unsafe_get())
-                .get_attr_for_layout(&ns!(), &local_name!("width"))
-                .map(AttrValue::as_dimension)
-                .cloned()
-                .unwrap_or(LengthOrPercentageOrAuto::Auto)
-        }
+    fn get_width(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("width"))
+            .map(AttrValue::as_dimension)
+            .cloned()
+            .unwrap_or(LengthOrPercentageOrAuto::Auto)
     }
 
-    #[allow(unsafe_code)]
-    fn get_height(&self) -> LengthOrPercentageOrAuto {
-        unsafe {
-            (*self.upcast::<Element>().unsafe_get())
-                .get_attr_for_layout(&ns!(), &local_name!("height"))
-                .map(AttrValue::as_dimension)
-                .cloned()
-                .unwrap_or(LengthOrPercentageOrAuto::Auto)
-        }
+    fn get_height(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("height"))
+            .map(AttrValue::as_dimension)
+            .cloned()
+            .unwrap_or(LengthOrPercentageOrAuto::Auto)
     }
 }
 
@@ -1459,6 +1424,21 @@ pub fn parse_a_sizes_attribute(value: DOMString) -> SourceSizeList {
         None,
     );
     SourceSizeList::parse(&context, &mut parser)
+}
+
+fn get_correct_referrerpolicy_from_raw_token(token: &DOMString) -> DOMString {
+    if token == "" {
+        // Empty token is treated as no-referrer inside determine_policy_for_token,
+        // while here it should be treated as the default value, so it should remain unchanged.
+        DOMString::new()
+    } else {
+        match determine_policy_for_token(token) {
+            Some(policy) => DOMString::from_string(policy.to_string()),
+            // If the policy is set to an incorrect value, then it should be
+            // treated as an invalid value default (empty string).
+            None => DOMString::new(),
+        }
+    }
 }
 
 impl HTMLImageElementMethods for HTMLImageElement {
@@ -1583,6 +1563,28 @@ impl HTMLImageElementMethods for HTMLImageElement {
         }
     }
 
+    // https://html.spec.whatwg.org/multipage/#dom-img-referrerpolicy
+    fn ReferrerPolicy(&self) -> DOMString {
+        let element = self.upcast::<Element>();
+        let current_policy_value = element.get_string_attribute(&local_name!("referrerpolicy"));
+        get_correct_referrerpolicy_from_raw_token(&current_policy_value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/#dom-img-referrerpolicy
+    fn SetReferrerPolicy(&self, value: DOMString) {
+        let referrerpolicy_attr_name = local_name!("referrerpolicy");
+        let element = self.upcast::<Element>();
+        let previous_correct_attribute_value = get_correct_referrerpolicy_from_raw_token(
+            &element.get_string_attribute(&referrerpolicy_attr_name),
+        );
+        let correct_value_or_empty_string = get_correct_referrerpolicy_from_raw_token(&value);
+        if previous_correct_attribute_value != correct_value_or_empty_string {
+            // Setting the attribute to the same value will update the image.
+            // We don't want to start an update if referrerpolicy is set to the same value.
+            element.set_string_attribute(&referrerpolicy_attr_name, correct_value_or_empty_string);
+        }
+    }
+
     // https://html.spec.whatwg.org/multipage/#dom-img-name
     make_getter!(Name, "name");
 
@@ -1637,7 +1639,8 @@ impl VirtualMethods for HTMLImageElement {
             &local_name!("srcset") |
             &local_name!("width") |
             &local_name!("crossorigin") |
-            &local_name!("sizes") => self.update_the_image_data(),
+            &local_name!("sizes") |
+            &local_name!("referrerpolicy") => self.update_the_image_data(),
             _ => {},
         }
     }

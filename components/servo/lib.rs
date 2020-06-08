@@ -51,9 +51,8 @@ pub use style;
 pub use style_traits;
 pub use webgpu;
 pub use webrender_api;
+pub use webrender_surfman;
 pub use webrender_traits;
-pub use webvr;
-pub use webvr_traits;
 
 #[cfg(feature = "webdriver")]
 fn webdriver(port: u16, constellation: Sender<ConstellationMsg>) {
@@ -80,7 +79,7 @@ use compositing::{CompositingReason, ConstellationMsg, IOCompositor, ShutdownSta
     not(target_arch = "aarch64")
 ))]
 use constellation::content_process_sandbox_profile;
-use constellation::{Constellation, InitialConstellationState, UnprivilegedPipelineContent};
+use constellation::{Constellation, InitialConstellationState, UnprivilegedContent};
 use constellation::{FromCompositorLogger, FromScriptLogger};
 use crossbeam_channel::{unbounded, Sender};
 use embedder_traits::{EmbedderMsg, EmbedderProxy, EmbedderReceiver, EventLoopWaker};
@@ -105,8 +104,9 @@ use profile::mem as profile_mem;
 use profile::time as profile_time;
 use profile_traits::mem;
 use profile_traits::time;
+use script::serviceworker_manager::ServiceWorkerManager;
 use script::JSEngineSetup;
-use script_traits::{SWManagerSenders, ScriptToConstellationChan, WindowSizeData};
+use script_traits::{ScriptToConstellationChan, WindowSizeData};
 use servo_config::opts;
 use servo_config::{pref, prefs};
 use servo_media::player::context::GlContext;
@@ -117,18 +117,11 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-#[cfg(not(target_os = "windows"))]
-use surfman::platform::default::device::Device as HWDevice;
-#[cfg(not(target_os = "windows"))]
-use surfman::platform::generic::osmesa::device::Device as SWDevice;
-#[cfg(not(target_os = "windows"))]
-use surfman::platform::generic::universal::context::Context;
-use surfman::platform::generic::universal::device::Device;
-use webrender::{RendererKind, ShaderPrecacheFlags};
+use surfman::GLApi;
+use webrender::ShaderPrecacheFlags;
+use webrender_surfman::WebrenderSurfman;
 use webrender_traits::WebrenderImageHandlerType;
 use webrender_traits::{WebrenderExternalImageHandlers, WebrenderExternalImageRegistry};
-use webvr::{VRServiceManager, WebVRCompositorHandler, WebVRThread};
-use webvr_traits::WebVRMsg;
 
 pub use gleam::gl;
 pub use keyboard_types;
@@ -320,7 +313,11 @@ impl<Window> Servo<Window>
 where
     Window: WindowMethods + 'static + ?Sized,
 {
-    pub fn new(mut embedder: Box<dyn EmbedderMethods>, window: Rc<Window>) -> Servo<Window> {
+    pub fn new(
+        mut embedder: Box<dyn EmbedderMethods>,
+        window: Rc<Window>,
+        user_agent: Option<String>,
+    ) -> Servo<Window> {
         // Global configuration options, parsed from the command line.
         let opts = opts::get();
 
@@ -337,8 +334,43 @@ where
             media_platform::init();
         }
 
+        let user_agent = match user_agent {
+            Some(ref ua) if ua == "ios" => default_user_agent_string_for(UserAgent::iOS).into(),
+            Some(ref ua) if ua == "android" => {
+                default_user_agent_string_for(UserAgent::Android).into()
+            },
+            Some(ref ua) if ua == "desktop" => {
+                default_user_agent_string_for(UserAgent::Desktop).into()
+            },
+            Some(ua) => ua.into(),
+            None => embedder
+                .get_user_agent_string()
+                .map(Into::into)
+                .unwrap_or(default_user_agent_string_for(DEFAULT_USER_AGENT).into()),
+        };
+
+        // Initialize surfman
+        let webrender_surfman = window.webrender_surfman();
+
+        // Get GL bindings
+        let webrender_gl = match webrender_surfman.connection().gl_api() {
+            GLApi::GL => unsafe { gl::GlFns::load_with(|s| webrender_surfman.get_proc_address(s)) },
+            GLApi::GLES => unsafe {
+                gl::GlesFns::load_with(|s| webrender_surfman.get_proc_address(s))
+            },
+        };
+
         // Make sure the gl context is made current.
-        window.make_gl_context_current();
+        webrender_surfman.make_gl_context_current().unwrap();
+        debug_assert_eq!(webrender_gl.get_error(), gleam::gl::NO_ERROR,);
+
+        // Bind the webrender framebuffer
+        let framebuffer_object = webrender_surfman
+            .context_surface_info()
+            .unwrap_or(None)
+            .map(|info| info.framebuffer_object)
+            .unwrap_or(0);
+        webrender_gl.bind_framebuffer(gleam::gl::FRAMEBUFFER, framebuffer_object);
 
         // Reserving a namespace to create TopLevelBrowserContextId.
         PipelineNamespace::install(PipelineNamespaceId(0));
@@ -354,7 +386,6 @@ where
         let time_profiler_chan = profile_time::Profiler::create(
             &opts.time_profiling,
             opts.time_profiler_trace_path.clone(),
-            opts.profile_heartbeats,
         );
         let mem_profiler_chan = profile_mem::Profiler::create(opts.mem_profiler_period);
 
@@ -368,20 +399,6 @@ where
         let viewport_size = coordinates.viewport.size.to_f32() / device_pixel_ratio;
 
         let (mut webrender, webrender_api_sender) = {
-            let renderer_kind = if opts::get().should_use_osmesa() {
-                RendererKind::OSMesa
-            } else {
-                RendererKind::Native
-            };
-
-            let recorder = if opts.webrender_record {
-                let record_path = PathBuf::from("wr-record.bin");
-                let recorder = Box::new(webrender::BinaryRecorder::new(&record_path));
-                Some(recorder as Box<dyn webrender::ApiRecordingReceiver>)
-            } else {
-                None
-            };
-
             let mut debug_flags = webrender::DebugFlags::empty();
             debug_flags.set(webrender::DebugFlags::PROFILER_DBG, opts.webrender_stats);
 
@@ -391,21 +408,20 @@ where
             let window_size = Size2D::from_untyped(viewport_size.to_i32().to_untyped());
 
             webrender::Renderer::new(
-                window.gl(),
+                webrender_gl.clone(),
                 render_notifier,
                 webrender::RendererOptions {
                     device_pixel_ratio,
                     resource_override_path: opts.shaders_dir.clone(),
                     enable_aa: opts.enable_text_antialiasing,
                     debug_flags: debug_flags,
-                    recorder: recorder,
                     precache_flags: if opts.precache_shaders {
                         ShaderPrecacheFlags::FULL_COMPILE
                     } else {
                         ShaderPrecacheFlags::empty()
                     },
-                    renderer_kind: renderer_kind,
                     enable_subpixel_aa: opts.enable_subpixel_text_antialiasing,
+                    allow_texture_swizzling: pref!(gfx.texture_swizzling.enabled),
                     clear_color: None,
                     ..Default::default()
                 },
@@ -428,48 +444,18 @@ where
             None
         };
 
-        if pref!(dom.webxr.enabled) && pref!(dom.webvr.enabled) {
-            panic!("We don't currently support running both WebVR and WebXR");
-        }
-
-        let mut webvr_heartbeats = Vec::new();
-        let webvr_services = if pref!(dom.webvr.enabled) {
-            let mut services = VRServiceManager::new();
-            services.register_defaults();
-            embedder.register_vr_services(&mut services, &mut webvr_heartbeats);
-            Some(services)
-        } else {
-            None
-        };
-
-        let (webvr_chan, webvr_constellation_sender, webvr_compositor) =
-            if let Some(services) = webvr_services {
-                // WebVR initialization
-                let (mut handler, sender) = WebVRCompositorHandler::new();
-                let (webvr_thread, constellation_sender) = WebVRThread::spawn(sender, services);
-                handler.set_webvr_thread_sender(webvr_thread.clone());
-                (
-                    Some(webvr_thread),
-                    Some(constellation_sender),
-                    Some(handler),
-                )
-            } else {
-                (None, None, None)
-            };
-
         let (external_image_handlers, external_images) = WebrenderExternalImageHandlers::new();
         let mut external_image_handlers = Box::new(external_image_handlers);
 
-        // For the moment, we enable use both the webxr crate and the rust-webvr crate,
-        // but we are migrating over to just using webxr.
         let mut webxr_main_thread = webxr::MainThreadRegistry::new(event_loop_waker)
             .expect("Failed to create WebXR device registry");
 
         let (webgl_threads, webgl_extras) = create_webgl_threads(
-            &*window,
+            webrender_surfman.clone(),
+            webrender_gl.clone(),
             &mut webrender,
             webrender_api_sender.clone(),
-            webvr_compositor,
+            webrender_document,
             &mut webxr_main_thread,
             &mut external_image_handlers,
             external_images.clone(),
@@ -481,6 +467,7 @@ where
                     &mut webxr_main_thread,
                     webgl_executor,
                     webxr_surface_providers,
+                    embedder_proxy.clone(),
                 );
             }
         }
@@ -518,10 +505,10 @@ where
         // Create the constellation, which maintains the engine
         // pipelines, including the script and layout threads, as well
         // as the navigation context.
-        let (constellation_chan, sw_senders) = create_constellation(
-            opts.user_agent.clone(),
+        let constellation_chan = create_constellation(
+            user_agent,
             opts.config_dir.clone(),
-            embedder_proxy.clone(),
+            embedder_proxy,
             compositor_proxy.clone(),
             time_profiler_chan.clone(),
             mem_profiler_chan.clone(),
@@ -532,16 +519,11 @@ where
             webxr_main_thread.registry(),
             player_context,
             webgl_threads,
-            webvr_chan,
-            webvr_constellation_sender,
             glplayer_threads,
             event_loop_waker,
             window_size,
             pending_wr_frame.clone(),
         );
-
-        // Send the constellation's swmanager sender to service worker manager thread
-        script::init_service_workers(sw_senders);
 
         if cfg!(feature = "webdriver") {
             if let Some(port) = opts.webdriver_port {
@@ -562,7 +544,8 @@ where
                 webrender,
                 webrender_document,
                 webrender_api,
-                webvr_heartbeats,
+                webrender_surfman,
+                webrender_gl,
                 webxr_main_thread,
                 pending_wr_frame,
             },
@@ -827,6 +810,10 @@ where
         log::set_max_level(filter);
     }
 
+    pub fn window(&self) -> &Window {
+        &self.compositor.window
+    }
+
     pub fn deinit(self) {
         self.compositor.deinit();
     }
@@ -872,13 +859,11 @@ fn create_constellation(
     webxr_registry: webxr_api::Registry,
     player_context: WindowGLContext,
     webgl_threads: Option<WebGLThreads>,
-    webvr_chan: Option<IpcSender<WebVRMsg>>,
-    webvr_constellation_sender: Option<Sender<Sender<ConstellationMsg>>>,
     glplayer_threads: Option<GLPlayerThreads>,
     event_loop_waker: Option<Box<dyn EventLoopWaker>>,
     initial_window_size: WindowSizeData,
     pending_wr_frame: Arc<AtomicBool>,
-) -> (Sender<ConstellationMsg>, SWManagerSenders) {
+) -> Sender<ConstellationMsg> {
     // Global configuration options, parsed from the command line.
     let opts = opts::get();
 
@@ -886,7 +871,7 @@ fn create_constellation(
         BluetoothThreadFactory::new(embedder_proxy.clone());
 
     let (public_resource_threads, private_resource_threads) = new_resource_threads(
-        user_agent,
+        user_agent.clone(),
         devtools_chan.clone(),
         time_profiler_chan.clone(),
         mem_profiler_chan.clone(),
@@ -897,9 +882,8 @@ fn create_constellation(
     let font_cache_thread = FontCacheThread::new(
         public_resource_threads.sender(),
         webrender_api_sender.create_api(),
+        webrender_document,
     );
-
-    let resource_sender = public_resource_threads.sender();
 
     let initial_state = InitialConstellationState {
         compositor_proxy,
@@ -914,21 +898,22 @@ fn create_constellation(
         mem_profiler_chan,
         webrender_document,
         webrender_api_sender,
-        webgl_threads,
-        webvr_chan,
         webxr_registry,
+        webgl_threads,
         glplayer_threads,
         player_context,
         event_loop_waker,
         pending_wr_frame,
+        user_agent,
     };
 
     let (canvas_chan, ipc_canvas_chan) = canvas::canvas_paint_thread::CanvasPaintThread::start();
 
-    let (constellation_chan, from_swmanager_sender) = Constellation::<
+    let constellation_chan = Constellation::<
         script_layout_interface::message::Msg,
         layout_thread::LayoutThread,
         script::script_thread::ScriptThread,
+        script::serviceworker_manager::ServiceWorkerManager,
     >::start(
         initial_state,
         initial_window_size,
@@ -941,20 +926,7 @@ fn create_constellation(
         ipc_canvas_chan,
     );
 
-    if let Some(webvr_constellation_sender) = webvr_constellation_sender {
-        // Set constellation channel used by WebVR thread to broadcast events
-        webvr_constellation_sender
-            .send(constellation_chan.clone())
-            .unwrap();
-    }
-
-    // channels to communicate with Service Worker Manager
-    let sw_senders = SWManagerSenders {
-        swmanager_sender: from_swmanager_sender,
-        resource_sender: resource_sender,
-    };
-
-    (constellation_chan, sw_senders)
+    constellation_chan
 }
 
 // A logger that logs to two downstream loggers.
@@ -996,42 +968,50 @@ pub fn set_logger(script_to_constellation_chan: ScriptToConstellationChan) {
 /// Content process entry point.
 pub fn run_content_process(token: String) {
     let (unprivileged_content_sender, unprivileged_content_receiver) =
-        ipc::channel::<UnprivilegedPipelineContent>().unwrap();
-    let connection_bootstrap: IpcSender<IpcSender<UnprivilegedPipelineContent>> =
+        ipc::channel::<UnprivilegedContent>().unwrap();
+    let connection_bootstrap: IpcSender<IpcSender<UnprivilegedContent>> =
         IpcSender::connect(token).unwrap();
     connection_bootstrap
         .send(unprivileged_content_sender)
         .unwrap();
 
-    let mut unprivileged_content = unprivileged_content_receiver.recv().unwrap();
+    let unprivileged_content = unprivileged_content_receiver.recv().unwrap();
     opts::set_options(unprivileged_content.opts());
     prefs::pref_map()
         .set_all(unprivileged_content.prefs())
         .expect("Failed to set preferences");
-    set_logger(unprivileged_content.script_to_constellation_chan().clone());
 
     // Enter the sandbox if necessary.
     if opts::get().sandbox {
         create_sandbox();
     }
 
-    let background_hang_monitor_register =
-        unprivileged_content.register_with_background_hang_monitor();
-
-    // send the required channels to the service worker manager
-    let sw_senders = unprivileged_content.swmanager_senders();
     let _js_engine_setup = script::init();
-    script::init_service_workers(sw_senders);
 
-    media_platform::init();
+    match unprivileged_content {
+        UnprivilegedContent::Pipeline(mut content) => {
+            media_platform::init();
 
-    unprivileged_content.start_all::<script_layout_interface::message::Msg,
-                                     layout_thread::LayoutThread,
-                                     script::script_thread::ScriptThread>(
-                                         true,
-                                         background_hang_monitor_register,
-                                         None,
-                                     );
+            set_logger(content.script_to_constellation_chan().clone());
+
+            let background_hang_monitor_register = if opts::get().background_hang_monitor {
+                content.register_with_background_hang_monitor()
+            } else {
+                None
+            };
+
+            content.start_all::<script_layout_interface::message::Msg,
+                                             layout_thread::LayoutThread,
+                                             script::script_thread::ScriptThread>(
+                                                 true,
+                                                 background_hang_monitor_register,
+                                                 None,
+                                             );
+        },
+        UnprivilegedContent::ServiceWorker(content) => {
+            content.start::<ServiceWorkerManager>();
+        },
+    }
 }
 
 #[cfg(all(
@@ -1059,56 +1039,20 @@ fn create_sandbox() {
 }
 
 // Initializes the WebGL thread.
-fn create_webgl_threads<W>(
-    window: &W,
+fn create_webgl_threads(
+    webrender_surfman: WebrenderSurfman,
+    webrender_gl: Rc<dyn gl::Gl>,
     webrender: &mut webrender::Renderer,
     webrender_api_sender: webrender_api::RenderApiSender,
-    webvr_compositor: Option<Box<WebVRCompositorHandler>>,
+    webrender_doc: webrender_api::DocumentId,
     webxr_main_thread: &mut webxr::MainThreadRegistry,
     external_image_handlers: &mut WebrenderExternalImageHandlers,
     external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
 ) -> (
     Option<WebGLThreads>,
     Option<(SurfaceProviders, WebGlExecutor)>,
-)
-where
-    W: WindowMethods + 'static + ?Sized,
-{
-    // Create a `surfman` device and context.
-    window.make_gl_context_current();
-
-    #[cfg(not(target_os = "windows"))]
-    let (device, context) = unsafe {
-        if opts::get().headless {
-            let (device, context) = match SWDevice::from_current_context() {
-                Ok(a) => a,
-                Err(e) => {
-                    warn!("Failed to create software graphics context: {:?}", e);
-                    return (None, None);
-                },
-            };
-            (Device::Software(device), Context::Software(context))
-        } else {
-            let (device, context) = match HWDevice::from_current_context() {
-                Ok(a) => a,
-                Err(e) => {
-                    warn!("Failed to create hardware graphics context: {:?}", e);
-                    return (None, None);
-                },
-            };
-            (Device::Hardware(device), Context::Hardware(context))
-        }
-    };
-    #[cfg(target_os = "windows")]
-    let (device, context) = match unsafe { Device::from_current_context() } {
-        Ok(a) => a,
-        Err(e) => {
-            warn!("Failed to create graphics context: {:?}", e);
-            return (None, None);
-        },
-    };
-
-    let gl_type = match window.gl().get_type() {
+) {
+    let gl_type = match webrender_gl.get_type() {
         gleam::gl::GlType::Gl => sparkle::gl::GlType::Gl,
         gleam::gl::GlType::Gles => sparkle::gl::GlType::Gles,
     };
@@ -1121,11 +1065,10 @@ where
         output_handler,
         webgl_executor,
     } = WebGLComm::new(
-        device,
-        context,
-        window.gl(),
+        webrender_surfman,
+        webrender_gl,
         webrender_api_sender,
-        webvr_compositor.map(|compositor| compositor as Box<_>),
+        webrender_doc,
         external_images,
         gl_type,
     );
@@ -1146,3 +1089,47 @@ where
         Some((webxr_surface_providers, webgl_executor)),
     )
 }
+
+enum UserAgent {
+    Desktop,
+    Android,
+    #[allow(non_camel_case_types)]
+    iOS,
+}
+
+fn default_user_agent_string_for(agent: UserAgent) -> &'static str {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    const DESKTOP_UA_STRING: &'static str =
+        "Mozilla/5.0 (X11; Linux x86_64; rv:75.0) Servo/1.0 Firefox/75.0";
+    #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+    const DESKTOP_UA_STRING: &'static str =
+        "Mozilla/5.0 (X11; Linux i686; rv:75.0) Servo/1.0 Firefox/75.0";
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    const DESKTOP_UA_STRING: &'static str =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:75.0) Servo/1.0 Firefox/75.0";
+    #[cfg(all(target_os = "windows", not(target_arch = "x86_64")))]
+    const DESKTOP_UA_STRING: &'static str =
+        "Mozilla/5.0 (Windows NT 10.0; rv:75.0) Servo/1.0 Firefox/75.0";
+
+    #[cfg(target_os = "macos")]
+    const DESKTOP_UA_STRING: &'static str =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:75.0) Servo/1.0 Firefox/75.0";
+
+    match agent {
+        UserAgent::Desktop => DESKTOP_UA_STRING,
+        UserAgent::Android => "Mozilla/5.0 (Android; Mobile; rv:68.0) Servo/1.0 Firefox/68.0",
+        UserAgent::iOS => {
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 13_4 like Mac OS X; rv:75.0) Servo/1.0 Firefox/75.0"
+        },
+    }
+}
+
+#[cfg(target_os = "android")]
+const DEFAULT_USER_AGENT: UserAgent = UserAgent::Android;
+
+#[cfg(target_os = "ios")]
+const DEFAULT_USER_AGENT: UserAgent = UserAgent::iOS;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const DEFAULT_USER_AGENT: UserAgent = UserAgent::Desktop;

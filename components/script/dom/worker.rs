@@ -20,6 +20,7 @@ use crate::dom::dedicatedworkerglobalscope::{
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageevent::MessageEvent;
+use crate::dom::window::Window;
 use crate::dom::workerglobalscope::prepare_workerscope_init;
 use crate::realms::enter_realm;
 use crate::script_runtime::JSContext;
@@ -86,7 +87,6 @@ impl Worker {
         let (sender, receiver) = unbounded();
         let closing = Arc::new(AtomicBool::new(false));
         let worker = Worker::new(global, sender.clone(), closing.clone());
-        global.track_worker(closing.clone());
         let worker_ref = Trusted::new(&*worker);
 
         let worker_load_origin = WorkerScriptLoadOrigin {
@@ -95,25 +95,38 @@ impl Worker {
             pipeline_id: global.pipeline_id(),
         };
 
+        let browsing_context = global
+            .downcast::<Window>()
+            .map(|w| w.window_proxy().browsing_context_id())
+            .or_else(|| {
+                global
+                    .downcast::<DedicatedWorkerGlobalScope>()
+                    .and_then(|w| w.browsing_context())
+            });
+
         let (devtools_sender, devtools_receiver) = ipc::channel().unwrap();
         let worker_id = WorkerId(Uuid::new_v4());
         if let Some(ref chan) = global.devtools_chan() {
             let pipeline_id = global.pipeline_id();
             let title = format!("Worker for {}", worker_url);
-            let page_info = DevtoolsPageInfo {
-                title: title,
-                url: worker_url.clone(),
-            };
-            let _ = chan.send(ScriptToDevtoolsControlMsg::NewGlobal(
-                (pipeline_id, Some(worker_id)),
-                devtools_sender.clone(),
-                page_info,
-            ));
+            if let Some(browsing_context) = browsing_context {
+                let page_info = DevtoolsPageInfo {
+                    title: title,
+                    url: worker_url.clone(),
+                };
+                let _ = chan.send(ScriptToDevtoolsControlMsg::NewGlobal(
+                    (browsing_context, pipeline_id, Some(worker_id)),
+                    devtools_sender.clone(),
+                    page_info,
+                ));
+            }
         }
 
-        let init = prepare_workerscope_init(global, Some(devtools_sender));
+        let init = prepare_workerscope_init(global, Some(devtools_sender), Some(worker_id));
 
-        DedicatedWorkerGlobalScope::run_worker_scope(
+        let (control_sender, control_receiver) = unbounded();
+
+        let join_handle = DedicatedWorkerGlobalScope::run_worker_scope(
             init,
             worker_url,
             devtools_receiver,
@@ -124,9 +137,14 @@ impl Worker {
             worker_load_origin,
             String::from(&*worker_options.name),
             worker_options.type_,
-            closing,
+            closing.clone(),
             global.image_cache(),
+            browsing_context,
+            global.wgpu_id_hub(),
+            control_receiver,
         );
+
+        global.track_worker(closing, join_handle, control_sender);
 
         Ok(worker)
     }

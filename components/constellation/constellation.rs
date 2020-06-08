@@ -96,6 +96,7 @@ use crate::browsingcontext::{
 use crate::event_loop::EventLoop;
 use crate::network_listener::NetworkListener;
 use crate::pipeline::{InitialPipelineState, Pipeline};
+use crate::serviceworker::ServiceWorkerUnprivilegedContent;
 use crate::session_history::{
     JointSessionHistory, NeedsToReload, SessionHistoryChange, SessionHistoryDiff,
 };
@@ -151,16 +152,19 @@ use script_traits::{HistoryEntryReplacement, IFrameSizeMsg, WindowSizeData, Wind
 use script_traits::{
     IFrameLoadInfo, IFrameLoadInfoWithData, IFrameSandboxState, TimerSchedulerMsg,
 };
-use script_traits::{LayoutMsg as FromLayoutMsg, ScriptMsg as FromScriptMsg, ScriptThreadFactory};
+use script_traits::{
+    Job, LayoutMsg as FromLayoutMsg, ScriptMsg as FromScriptMsg, ScriptThreadFactory,
+    ServiceWorkerManagerFactory,
+};
 use script_traits::{MediaSessionActionType, MouseEventType};
 use script_traits::{MessagePortMsg, PortMessageTask, StructuredSerializedData};
-use script_traits::{SWManagerMsg, ScopeThings, UpdatePipelineIdReason, WebDriverCommandMsg};
+use script_traits::{SWManagerMsg, SWManagerSenders, UpdatePipelineIdReason, WebDriverCommandMsg};
 use serde::{Deserialize, Serialize};
 use servo_config::{opts, pref};
 use servo_rand::{random, Rng, ServoRng, SliceRandom};
 use servo_remutex::ReentrantMutex;
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
-use std::borrow::ToOwned;
+use std::borrow::{Cow, ToOwned};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
@@ -173,7 +177,6 @@ use std::thread;
 use style_traits::viewport::ViewportConstraints;
 use style_traits::CSSPixel;
 use webgpu::{WebGPU, WebGPURequest};
-use webvr_traits::{WebVREvent, WebVRMsg};
 
 type PendingApprovalNavigations = HashMap<PipelineId, (LoadData, HistoryEntryReplacement)>;
 
@@ -259,7 +262,7 @@ struct BrowsingContextGroup {
 /// `LayoutThread` in the `layout` crate, and `ScriptThread` in
 /// the `script` crate). Script and layout communicate using a `Message`
 /// type.
-pub struct Constellation<Message, LTF, STF> {
+pub struct Constellation<Message, LTF, STF, SWF> {
     /// An ipc-sender/threaded-receiver pair
     /// to facilitate installing pipeline namespaces in threads
     /// via a per-process installer.
@@ -348,9 +351,8 @@ pub struct Constellation<Message, LTF, STF> {
     /// bluetooth thread.
     bluetooth_thread: IpcSender<BluetoothRequest>,
 
-    /// An IPC channel for the constellation to send messages to the
-    /// Service Worker Manager thread.
-    swmanager_chan: Option<IpcSender<ServiceWorkerMsg>>,
+    /// A map of origin to sender to a Service worker manager.
+    sw_managers: HashMap<ImmutableOrigin, IpcSender<ServiceWorkerMsg>>,
 
     /// An IPC channel for Service Worker Manager threads to send
     /// messages to the constellation.  This is the SW Manager thread's
@@ -453,13 +455,10 @@ pub struct Constellation<Message, LTF, STF> {
     random_pipeline_closure: Option<(ServoRng, f32)>,
 
     /// Phantom data that keeps the Rust type system happy.
-    phantom: PhantomData<(Message, LTF, STF)>,
+    phantom: PhantomData<(Message, LTF, STF, SWF)>,
 
     /// Entry point to create and get channels to a WebGLThread.
     webgl_threads: Option<WebGLThreads>,
-
-    /// A channel through which messages can be sent to the webvr thread.
-    webvr_chan: Option<IpcSender<WebVRMsg>>,
 
     /// The XR device registry
     webxr_registry: webxr_api::Registry,
@@ -498,6 +497,9 @@ pub struct Constellation<Message, LTF, STF> {
 
     /// Pipeline ID of the active media session.
     active_media_session: Option<PipelineId>,
+
+    /// User agent string to report in network requests.
+    user_agent: Cow<'static, str>,
 }
 
 /// State needed to construct a constellation.
@@ -541,9 +543,6 @@ pub struct InitialConstellationState {
     /// Entry point to create and get channels to a WebGLThread.
     pub webgl_threads: Option<WebGLThreads>,
 
-    /// A channel to the webgl thread.
-    pub webvr_chan: Option<IpcSender<WebVRMsg>>,
-
     /// The XR device registry
     pub webxr_registry: webxr_api::Registry,
 
@@ -557,6 +556,9 @@ pub struct InitialConstellationState {
 
     /// A flag share with the compositor to indicate that a WR frame is in progress.
     pub pending_wr_frame: Arc<AtomicBool>,
+
+    /// User agent string to report in network requests.
+    pub user_agent: Cow<'static, str>,
 }
 
 /// Data needed for webdriver
@@ -734,6 +736,7 @@ enum WebrenderMsg {
 fn handle_webrender_message(
     pending_wr_frame: &AtomicBool,
     webrender_api: &webrender_api::RenderApi,
+    webrender_doc: webrender_api::DocumentId,
     msg: WebrenderMsg,
 ) {
     match msg {
@@ -806,17 +809,35 @@ fn handle_webrender_message(
             let _ = sender.send(webrender_api.generate_image_key());
         },
 
-        WebrenderMsg::Layout(script_traits::WebrenderMsg::UpdateResources(updates)) |
-        WebrenderMsg::Net(net_traits::WebrenderImageMsg::UpdateResources(updates)) => {
-            webrender_api.update_resources(updates);
+        WebrenderMsg::Layout(script_traits::WebrenderMsg::UpdateImages(updates)) => {
+            let mut txn = webrender_api::Transaction::new();
+            for update in updates {
+                match update {
+                    script_traits::ImageUpdate::AddImage(key, desc, data) => {
+                        txn.add_image(key, desc, data, None)
+                    },
+                    script_traits::ImageUpdate::DeleteImage(key) => txn.delete_image(key),
+                    script_traits::ImageUpdate::UpdateImage(key, desc, data) => {
+                        txn.update_image(key, desc, data, &webrender_api::DirtyRect::All)
+                    },
+                }
+            }
+            webrender_api.send_transaction(webrender_doc, txn);
+        },
+
+        WebrenderMsg::Net(net_traits::WebrenderImageMsg::AddImage(key, desc, data)) => {
+            let mut txn = webrender_api::Transaction::new();
+            txn.add_image(key, desc, data, None);
+            webrender_api.send_transaction(webrender_doc, txn);
         },
     }
 }
 
-impl<Message, LTF, STF> Constellation<Message, LTF, STF>
+impl<Message, LTF, STF, SWF> Constellation<Message, LTF, STF, SWF>
 where
     LTF: LayoutThreadFactory<Message = Message>,
     STF: ScriptThreadFactory<Message = Message>,
+    SWF: ServiceWorkerManagerFactory,
 {
     /// Create a new constellation thread.
     pub fn start(
@@ -829,12 +850,11 @@ where
         enable_canvas_antialiasing: bool,
         canvas_chan: Sender<ConstellationCanvasMsg>,
         ipc_canvas_chan: IpcSender<CanvasMsg>,
-    ) -> (Sender<FromCompositorMsg>, IpcSender<SWManagerMsg>) {
+    ) -> Sender<FromCompositorMsg> {
         let (compositor_sender, compositor_receiver) = unbounded();
 
         // service worker manager to communicate with constellation
         let (swmanager_sender, swmanager_receiver) = ipc::channel().expect("ipc channel failure");
-        let sw_mgr_clone = swmanager_sender.clone();
 
         thread::Builder::new()
             .name("Constellation".to_owned())
@@ -912,6 +932,7 @@ where
                     ipc::channel().expect("ipc channel failure");
 
                 let webrender_api = state.webrender_api_sender.create_api();
+                let webrender_doc = state.webrender_document;
                 let pending_wr_frame_clone = state.pending_wr_frame.clone();
                 ROUTER.add_route(
                     webrender_ipc_receiver.to_opaque(),
@@ -919,6 +940,7 @@ where
                         handle_webrender_message(
                             &pending_wr_frame_clone,
                             &webrender_api,
+                            webrender_doc,
                             WebrenderMsg::Layout(message.to().expect("conversion failure")),
                         )
                     }),
@@ -932,12 +954,13 @@ where
                         handle_webrender_message(
                             &pending_wr_frame_clone,
                             &webrender_api,
+                            webrender_doc,
                             WebrenderMsg::Net(message.to().expect("conversion failure")),
                         )
                     }),
                 );
 
-                let mut constellation: Constellation<Message, LTF, STF> = Constellation {
+                let mut constellation: Constellation<Message, LTF, STF, SWF> = Constellation {
                     namespace_receiver,
                     namespace_sender,
                     script_sender: ipc_script_sender,
@@ -961,9 +984,9 @@ where
                     public_resource_threads: state.public_resource_threads,
                     private_resource_threads: state.private_resource_threads,
                     font_cache_thread: state.font_cache_thread,
-                    swmanager_chan: None,
+                    sw_managers: Default::default(),
                     swmanager_receiver: swmanager_receiver,
-                    swmanager_sender: sw_mgr_clone,
+                    swmanager_sender,
                     browsing_context_group_set: Default::default(),
                     browsing_context_group_next_id: Default::default(),
                     message_ports: HashMap::new(),
@@ -1003,7 +1026,6 @@ where
                         (rng, prob)
                     }),
                     webgl_threads: state.webgl_threads,
-                    webvr_chan: state.webvr_chan,
                     webxr_registry: state.webxr_registry,
                     canvas_chan,
                     ipc_canvas_chan,
@@ -1016,13 +1038,14 @@ where
                     player_context: state.player_context,
                     event_loop_waker: state.event_loop_waker,
                     active_media_session: None,
+                    user_agent: state.user_agent,
                 };
 
                 constellation.run();
             })
             .expect("Thread spawning failed");
 
-        (compositor_sender, swmanager_sender)
+        compositor_sender
     }
 
     /// The main event loop for the constellation.
@@ -1259,10 +1282,10 @@ where
                 .webgl_threads
                 .as_ref()
                 .map(|threads| threads.pipeline()),
-            webvr_chan: self.webvr_chan.clone(),
             webxr_registry: self.webxr_registry.clone(),
             player_context: self.player_context.clone(),
             event_loop_waker: self.event_loop_waker.as_ref().map(|w| (*w).clone_box()),
+            user_agent: self.user_agent.clone(),
         });
 
         let pipeline = match result {
@@ -1530,9 +1553,9 @@ where
 
     fn handle_request_from_swmanager(&mut self, message: SWManagerMsg) {
         match message {
-            SWManagerMsg::OwnSender(sw_sender) => {
-                // store service worker manager for communicating with it.
-                self.swmanager_chan = Some(sw_sender);
+            SWManagerMsg::PostMessageToClient => {
+                // TODO: implement posting a message to a SW client.
+                // https://github.com/servo/servo/issues/24660
             },
         }
     }
@@ -1690,9 +1713,6 @@ where
             },
             FromCompositorMsg::LogEntry(top_level_browsing_context_id, thread_name, entry) => {
                 self.handle_log_entry(top_level_browsing_context_id, thread_name, entry);
-            },
-            FromCompositorMsg::WebVREvents(pipeline_ids, events) => {
-                self.handle_webvr_events(pipeline_ids, events);
             },
             FromCompositorMsg::ForwardEvent(destination_pipeline_id, event) => {
                 self.forward_event(destination_pipeline_id, event);
@@ -1961,11 +1981,11 @@ where
                     );
                 }
             },
-            FromScriptMsg::RegisterServiceWorker(scope_things, scope) => {
-                self.handle_register_serviceworker(scope_things, scope);
+            FromScriptMsg::ScheduleJob(job) => {
+                self.handle_schedule_serviceworker_job(source_pipeline_id, job);
             },
             FromScriptMsg::ForwardDOMMessage(msg_vec, scope_url) => {
-                if let Some(ref mgr) = self.swmanager_chan {
+                if let Some(mgr) = self.sw_managers.get(&scope_url.origin()) {
                     let _ = mgr.send(ServiceWorkerMsg::ForwardDOMMessage(msg_vec, scope_url));
                 } else {
                     warn!("Unable to forward DOMMessage for postMessage call");
@@ -2189,16 +2209,13 @@ where
             Some(bc) => &bc.bc_group_id,
             None => return warn!("Browsing context not found"),
         };
-        let host = match self
-            .pipelines
-            .get(&source_pipeline_id)
-            .map(|pipeline| &pipeline.url)
-        {
-            Some(ref url) => match reg_host(&url) {
-                Some(host) => host,
-                None => return warn!("Invalid host url"),
-            },
+        let source_pipeline = match self.pipelines.get(&source_pipeline_id) {
+            Some(pipeline) => pipeline,
             None => return warn!("ScriptMsg from closed pipeline {:?}.", source_pipeline_id),
+        };
+        let host = match reg_host(&source_pipeline.url) {
+            Some(host) => host,
+            None => return warn!("Invalid host url"),
         };
         match self
             .browsing_context_group_set
@@ -2218,7 +2235,16 @@ where
                 let send = match browsing_context_group.webgpus.entry(host) {
                     Entry::Vacant(v) => v
                         .insert(match WebGPU::new() {
-                            Some(webgpu) => webgpu,
+                            Some(webgpu) => {
+                                let msg = ConstellationControlMsg::SetWebGPUPort(webgpu.1);
+                                if let Err(e) = source_pipeline.event_loop.send(msg) {
+                                    warn!(
+                                        "Failed to send SetWebGPUPort to pipeline {} ({:?})",
+                                        source_pipeline_id, e
+                                    );
+                                }
+                                webgpu.0
+                            },
                             None => return warn!("Failed to create new WebGPU thread"),
                         })
                         .0
@@ -2236,9 +2262,6 @@ where
     fn handle_request_from_layout(&mut self, message: FromLayoutMsg) {
         debug!("Constellation got {:?} message", message);
         match message {
-            FromLayoutMsg::ChangeRunningAnimationsState(pipeline_id, animation_state) => {
-                self.handle_change_running_animations_state(pipeline_id, animation_state)
-            },
             // Layout sends new sizes for all subframes. This needs to be reflected by all
             // frame trees in the navigation context containing the subframe.
             FromLayoutMsg::IFrameSizes(iframe_sizes) => {
@@ -2621,12 +2644,49 @@ where
         }
     }
 
-    fn handle_register_serviceworker(&self, scope_things: ScopeThings, scope: ServoUrl) {
-        if let Some(ref mgr) = self.swmanager_chan {
-            let _ = mgr.send(ServiceWorkerMsg::RegisterServiceWorker(scope_things, scope));
-        } else {
-            warn!("sending scope info to service worker manager failed");
+    /// <https://w3c.github.io/ServiceWorker/#schedule-job-algorithm>
+    /// and
+    /// <https://w3c.github.io/ServiceWorker/#dfn-job-queue>
+    ///
+    /// The Job Queue is essentially the channel to a SW manager,
+    /// which are scoped per origin.
+    fn handle_schedule_serviceworker_job(&mut self, pipeline_id: PipelineId, job: Job) {
+        let origin = job.scope_url.origin();
+
+        if self
+            .check_origin_against_pipeline(&pipeline_id, &origin)
+            .is_err()
+        {
+            return warn!(
+                "Attempt to schedule a serviceworker job from an origin not matching the origin of the job."
+            );
         }
+
+        // This match is equivalent to Entry.or_insert_with but allows for early return.
+        let sw_manager = match self.sw_managers.entry(origin.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let (own_sender, receiver) = ipc::channel().expect("Failed to create IPC channel!");
+
+                let sw_senders = SWManagerSenders {
+                    swmanager_sender: self.swmanager_sender.clone(),
+                    resource_sender: self.public_resource_threads.sender(),
+                    own_sender: own_sender.clone(),
+                    receiver,
+                };
+                let content = ServiceWorkerUnprivilegedContent::new(sw_senders, origin);
+
+                if opts::multiprocess() {
+                    if content.spawn_multiprocess().is_err() {
+                        return warn!("Failed to spawn process for SW manager.");
+                    }
+                } else {
+                    content.start::<SWF>();
+                }
+                entry.insert(own_sender)
+            },
+        };
+        let _ = sw_manager.send(ServiceWorkerMsg::ScheduleJob(job));
     }
 
     fn handle_broadcast_storage_event(
@@ -2763,7 +2823,7 @@ where
         }
 
         debug!("Exiting service worker manager thread.");
-        if let Some(mgr) = self.swmanager_chan.as_ref() {
+        for (_, mgr) in self.sw_managers.drain() {
             if let Err(e) = mgr.send(ServiceWorkerMsg::Exit) {
                 warn!("Exit service worker manager failed ({})", e);
             }
@@ -2805,13 +2865,6 @@ where
             }
         }
 
-        if let Some(chan) = self.webvr_chan.as_ref() {
-            debug!("Exiting WebVR thread.");
-            if let Err(e) = chan.send(WebVRMsg::Exit) {
-                warn!("Exit WebVR thread failed ({})", e);
-            }
-        }
-
         debug!("Exiting GLPlayer thread.");
         if let Some(glplayer_threads) = self.glplayer_threads.as_ref() {
             if let Err(e) = glplayer_threads.exit() {
@@ -2833,6 +2886,9 @@ where
         debug!("Asking compositor to complete shutdown.");
         self.compositor_proxy
             .send(ToCompositorMsg::ShutdownComplete);
+
+        debug!("Shutting-down IPC router thread in constellation.");
+        ROUTER.shutdown();
     }
 
     fn handle_pipeline_exited(&mut self, pipeline_id: PipelineId) {
@@ -2953,20 +3009,6 @@ where
                 }
                 self.handled_warnings.push_back((thread_name, reason));
             },
-        }
-    }
-
-    fn handle_webvr_events(&mut self, ids: Vec<PipelineId>, events: Vec<WebVREvent>) {
-        for id in ids {
-            match self.pipelines.get_mut(&id) {
-                Some(ref pipeline) => {
-                    // Notify script thread
-                    let _ = pipeline
-                        .event_loop
-                        .send(ConstellationControlMsg::WebVREvents(id, events.clone()));
-                },
-                None => warn!("constellation got webvr event for dead pipeline"),
-            }
         }
     }
 
@@ -3455,27 +3497,13 @@ where
     }
 
     fn handle_tick_animation(&mut self, pipeline_id: PipelineId, tick_type: AnimationTickType) {
-        let result = match tick_type {
-            AnimationTickType::Script => {
-                let msg = ConstellationControlMsg::TickAllAnimations(pipeline_id);
-                match self.pipelines.get(&pipeline_id) {
-                    Some(pipeline) => pipeline.event_loop.send(msg),
-                    None => {
-                        return warn!("Pipeline {:?} got script tick after closure.", pipeline_id);
-                    },
-                }
-            },
-            AnimationTickType::Layout => match self.pipelines.get(&pipeline_id) {
-                Some(pipeline) => {
-                    let msg = LayoutControlMsg::TickAnimations(pipeline.load_data.url.origin());
-                    pipeline.layout_chan.send(msg)
-                },
-                None => {
-                    return warn!("Pipeline {:?} got layout tick after closure.", pipeline_id);
-                },
-            },
+        let pipeline = match self.pipelines.get(&pipeline_id) {
+            Some(pipeline) => pipeline,
+            None => return warn!("Pipeline {:?} got script tick after closure.", pipeline_id),
         };
-        if let Err(e) = result {
+
+        let message = ConstellationControlMsg::TickAllAnimations(pipeline_id, tick_type);
+        if let Err(e) = pipeline.event_loop.send(message) {
             self.handle_send_error(pipeline_id, e);
         }
     }
@@ -4365,6 +4393,7 @@ where
             id_sender: canvas_id_sender,
             size,
             webrender_sender: webrender_api,
+            webrender_doc: self.webrender_document,
             antialias: self.enable_canvas_antialiasing,
         }) {
             return warn!("Create canvas paint thread failed ({})", e);

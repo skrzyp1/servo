@@ -25,16 +25,24 @@ use headers::{
 use headers::{AccessControlAllowOrigin, AccessControlMaxAge};
 use headers::{CacheControl, ContentEncoding, ContentLength};
 use headers::{IfModifiedSince, LastModified, Origin as HyperOrigin, Pragma, Referer, UserAgent};
-use http::header::{self, HeaderName, HeaderValue};
+use http::header::{
+    self, HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LOCATION,
+    CONTENT_TYPE,
+};
 use http::{HeaderMap, Request as HyperRequest};
 use hyper::{Body, Client, Method, Response as HyperResponse, StatusCode};
 use hyper_serde::Serde;
+use ipc_channel::ipc::{self, IpcSender};
+use ipc_channel::router::ROUTER;
 use msg::constellation_msg::{HistoryStateId, PipelineId};
+use net_traits::pub_domains::reg_suffix;
 use net_traits::quality::{quality_to_value, Quality, QualityItem};
 use net_traits::request::Origin::Origin as SpecificOrigin;
 use net_traits::request::{is_cors_safelisted_method, is_cors_safelisted_request_header};
+use net_traits::request::{
+    BodyChunkRequest, RedirectMode, Referrer, Request, RequestBuilder, RequestMode,
+};
 use net_traits::request::{CacheMode, CredentialsMode, Destination, Origin};
-use net_traits::request::{RedirectMode, Referrer, Request, RequestBuilder, RequestMode};
 use net_traits::request::{ResponseTainting, ServiceWorkersMode};
 use net_traits::response::{HttpsState, Response, ResponseBody, ResponseType};
 use net_traits::{CookieSource, FetchMetadata, NetworkError, ReferrerPolicy};
@@ -48,14 +56,15 @@ use std::iter::FromIterator;
 use std::mem;
 use std::ops::Deref;
 use std::str::FromStr;
-use std::sync::{Condvar, Mutex, RwLock};
+use std::sync::{Arc as StdArc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 use time::{self, Tm};
-use tokio::prelude::{future, Future, Stream};
+use tokio::prelude::{future, Future, Sink, Stream};
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc::channel;
 
 lazy_static! {
-    pub static ref HANDLE: Mutex<Runtime> = { Mutex::new(Runtime::new().unwrap()) };
+    pub static ref HANDLE: Mutex<Option<Runtime>> = Mutex::new(Some(Runtime::new().unwrap()));
 }
 
 /// The various states an entry of the HttpCache can be in.
@@ -91,7 +100,10 @@ impl HttpState {
             history_states: RwLock::new(HashMap::new()),
             http_cache: RwLock::new(HttpCache::new()),
             http_cache_state: Mutex::new(HashMap::new()),
-            client: create_http_client(tls_config, HANDLE.lock().unwrap().executor()),
+            client: create_http_client(
+                tls_config,
+                HANDLE.lock().unwrap().as_ref().unwrap().executor(),
+            ),
         }
     }
 }
@@ -162,28 +174,65 @@ pub fn set_default_accept_language(headers: &mut HeaderMap) {
 }
 
 /// <https://w3c.github.io/webappsec-referrer-policy/#referrer-policy-state-no-referrer-when-downgrade>
-fn no_referrer_when_downgrade_header(referrer_url: ServoUrl, url: ServoUrl) -> Option<ServoUrl> {
-    if referrer_url.scheme() == "https" && url.scheme() != "https" {
+fn no_referrer_when_downgrade_header(
+    referrer_url: ServoUrl,
+    url: ServoUrl,
+    https_state: HttpsState,
+) -> Option<ServoUrl> {
+    if https_state == HttpsState::Modern && !url.is_origin_trustworthy() {
         return None;
     }
     return strip_url(referrer_url, false);
 }
 
 /// <https://w3c.github.io/webappsec-referrer-policy/#referrer-policy-strict-origin>
-fn strict_origin(referrer_url: ServoUrl, url: ServoUrl) -> Option<ServoUrl> {
-    if referrer_url.scheme() == "https" && url.scheme() != "https" {
+fn strict_origin(
+    referrer_url: ServoUrl,
+    url: ServoUrl,
+    https_state: HttpsState,
+) -> Option<ServoUrl> {
+    if https_state == HttpsState::Modern && !url.is_origin_trustworthy() {
         return None;
     }
     strip_url(referrer_url, true)
 }
 
 /// <https://w3c.github.io/webappsec-referrer-policy/#referrer-policy-strict-origin-when-cross-origin>
-fn strict_origin_when_cross_origin(referrer_url: ServoUrl, url: ServoUrl) -> Option<ServoUrl> {
-    if referrer_url.scheme() == "https" && url.scheme() != "https" {
+fn strict_origin_when_cross_origin(
+    referrer_url: ServoUrl,
+    url: ServoUrl,
+    https_state: HttpsState,
+) -> Option<ServoUrl> {
+    let same_origin = referrer_url.origin() == url.origin();
+    if same_origin {
+        return strip_url(referrer_url, false);
+    }
+    if https_state == HttpsState::Modern && !url.is_origin_trustworthy() {
         return None;
     }
-    let cross_origin = referrer_url.origin() != url.origin();
-    strip_url(referrer_url, cross_origin)
+    strip_url(referrer_url, true)
+}
+
+/// https://html.spec.whatwg.org/multipage/#schemelessly-same-site
+fn is_schemelessy_same_site(site_a: &ImmutableOrigin, site_b: &ImmutableOrigin) -> bool {
+    // Step 1
+    if !site_a.is_tuple() && !site_b.is_tuple() && site_a == site_b {
+        true
+    } else if site_a.is_tuple() && site_b.is_tuple() {
+        // Step 2.1
+        let host_a = site_a.host().map(|h| h.to_string()).unwrap_or_default();
+        let host_b = site_b.host().map(|h| h.to_string()).unwrap_or_default();
+
+        let host_a_reg = reg_suffix(&host_a);
+        let host_b_reg = reg_suffix(&host_b);
+
+        // Step 2.2-2.3
+        (site_a.host() == site_b.host() && host_a_reg == "") ||
+            (host_a_reg == host_b_reg && host_a_reg != "")
+    } else {
+        // Step 3
+        false
+    }
 }
 
 /// <https://w3c.github.io/webappsec-referrer-policy/#strip-url>
@@ -213,13 +262,12 @@ pub fn determine_request_referrer(
     referrer_policy: ReferrerPolicy,
     referrer_source: ServoUrl,
     current_url: ServoUrl,
+    https_state: HttpsState,
 ) -> Option<ServoUrl> {
     assert!(!headers.contains_key(header::REFERER));
     // FIXME(#14505): this does not seem to be the correct way of checking for
     //                same-origin requests.
     let cross_origin = referrer_source.origin() != current_url.origin();
-    // FIXME(#14506): some of these cases are expected to consider whether the
-    //                request's client is "TLS-protected", whatever that means.
     match referrer_policy {
         ReferrerPolicy::NoReferrer => None,
         ReferrerPolicy::Origin => strip_url(referrer_source, true),
@@ -232,12 +280,12 @@ pub fn determine_request_referrer(
         },
         ReferrerPolicy::UnsafeUrl => strip_url(referrer_source, false),
         ReferrerPolicy::OriginWhenCrossOrigin => strip_url(referrer_source, cross_origin),
-        ReferrerPolicy::StrictOrigin => strict_origin(referrer_source, current_url),
+        ReferrerPolicy::StrictOrigin => strict_origin(referrer_source, current_url, https_state),
         ReferrerPolicy::StrictOriginWhenCrossOrigin => {
-            strict_origin_when_cross_origin(referrer_source, current_url)
+            strict_origin_when_cross_origin(referrer_source, current_url, https_state)
         },
         ReferrerPolicy::NoReferrerWhenDowngrade => {
-            no_referrer_when_downgrade_header(referrer_source, current_url)
+            no_referrer_when_downgrade_header(referrer_source, current_url, https_state)
         },
     }
 }
@@ -358,10 +406,8 @@ fn obtain_response(
     url: &ServoUrl,
     method: &Method,
     request_headers: &HeaderMap,
-    data: &Option<Vec<u8>>,
-    load_data_method: &Method,
+    body: Option<IpcSender<BodyChunkRequest>>,
     pipeline_id: &Option<PipelineId>,
-    iters: u32,
     request_id: Option<&str>,
     is_xhr: bool,
     context: &FetchContext,
@@ -371,28 +417,70 @@ fn obtain_response(
         Error = NetworkError,
     >,
 > {
-    let mut headers = request_headers.clone();
+    let headers = request_headers.clone();
 
-    // Avoid automatically sending request body if a redirect has occurred.
-    //
-    // TODO - This is the wrong behaviour according to the RFC. However, I'm not
-    // sure how much "correctness" vs. real-world is important in this case.
-    //
-    // https://tools.ietf.org/html/rfc7231#section-6.4
-    let is_redirected_request = iters != 1;
-    let request_body;
-    match data {
-        &Some(ref d) if !is_redirected_request => {
-            headers.typed_insert(ContentLength(d.len() as u64));
-            request_body = d.clone();
-        },
-        _ => {
-            if *load_data_method != Method::GET && *load_data_method != Method::HEAD {
-                headers.typed_insert(ContentLength(0))
-            }
-            request_body = vec![];
-        },
-    }
+    let devtools_bytes = StdArc::new(Mutex::new(vec![]));
+
+    // https://url.spec.whatwg.org/#percent-encoded-bytes
+    let encoded_url = url
+        .clone()
+        .into_url()
+        .as_ref()
+        .replace("|", "%7C")
+        .replace("{", "%7B")
+        .replace("}", "%7D");
+
+    let request = if let Some(chunk_requester) = body {
+        // TODO: If body is a stream, append `Transfer-Encoding`/`chunked`,
+        // see step 4.2 of https://fetch.spec.whatwg.org/#concept-http-network-fetch
+
+        let (body_chan, body_port) = ipc::channel().unwrap();
+
+        let (sender, receiver) = channel(1);
+
+        let _ = chunk_requester.send(BodyChunkRequest::Connect(body_chan));
+
+        // https://fetch.spec.whatwg.org/#concept-request-transmit-body
+        // Request the first chunk, corresponding to Step 3 and 4.
+        let _ = chunk_requester.send(BodyChunkRequest::Chunk);
+
+        let devtools_bytes = devtools_bytes.clone();
+
+        ROUTER.add_route(
+            body_port.to_opaque(),
+            Box::new(move |message| {
+                let bytes: Vec<u8> = message.to().unwrap();
+                let chunk_requester = chunk_requester.clone();
+                let sender = sender.clone();
+
+                devtools_bytes.lock().unwrap().append(&mut bytes.clone());
+
+                HANDLE.lock().unwrap().as_mut().unwrap().spawn(
+                    // Step 5.1.2.2
+                    // Transmit a chunk over the network(and blocking until this is done).
+                    sender
+                        .send(bytes)
+                        .map(move |_| {
+                            // Step 5.1.2.3
+                            // Request the next chunk.
+                            let _ = chunk_requester.send(BodyChunkRequest::Chunk);
+                            ()
+                        })
+                        .map_err(|_| ()),
+                );
+            }),
+        );
+
+        HyperRequest::builder()
+            .method(method)
+            .uri(encoded_url)
+            .body(Body::wrap_stream(receiver))
+    } else {
+        HyperRequest::builder()
+            .method(method)
+            .uri(encoded_url)
+            .body(Body::empty())
+    };
 
     context
         .timing
@@ -408,19 +496,6 @@ fn obtain_response(
         .lock()
         .unwrap()
         .set_attribute(ResourceAttribute::ConnectStart(connect_start));
-
-    // https://url.spec.whatwg.org/#percent-encoded-bytes
-    let request = HyperRequest::builder()
-        .method(method)
-        .uri(
-            url.clone()
-                .into_url()
-                .as_ref()
-                .replace("|", "%7C")
-                .replace("{", "%7B")
-                .replace("}", "%7D"),
-        )
-        .body(request_body.clone().into());
 
     // TODO: We currently don't know when the handhhake before the connection is done
     // so our best bet would be to set `secure_connection_start` here when we are currently
@@ -452,6 +527,7 @@ fn obtain_response(
     let method = method.clone();
     let send_start = precise_time_ms();
 
+    let headers = headers.clone();
     Box::new(
         client
             .request(request)
@@ -467,7 +543,7 @@ fn obtain_response(
                             closure_url,
                             method.clone(),
                             headers,
-                            Some(request_body.clone()),
+                            Some(devtools_bytes.lock().unwrap().clone()),
                             pipeline_id,
                             time::now(),
                             connect_end - connect_start,
@@ -783,7 +859,7 @@ pub fn http_redirect_fetch(
         .status
         .as_ref()
         .map_or(true, |s| s.0 != StatusCode::SEE_OTHER) &&
-        request.body.as_ref().map_or(false, |b| b.is_empty())
+        request.body.as_ref().map_or(false, |b| b.source_is_null())
     {
         return Response::network_error(NetworkError::Internal("Request body is not done".into()));
     }
@@ -801,11 +877,23 @@ pub fn http_redirect_fetch(
         .map_or(false, |(code, _)| {
             ((*code == StatusCode::MOVED_PERMANENTLY || *code == StatusCode::FOUND) &&
                 request.method == Method::POST) ||
-                (*code == StatusCode::SEE_OTHER && request.method != Method::HEAD)
+                (*code == StatusCode::SEE_OTHER &&
+                    request.method != Method::HEAD &&
+                    request.method != Method::GET)
         })
     {
+        // Step 11.1
         request.method = Method::GET;
         request.body = None;
+        // Step 11.2
+        for name in &[
+            CONTENT_ENCODING,
+            CONTENT_LANGUAGE,
+            CONTENT_LOCATION,
+            CONTENT_TYPE,
+        ] {
+            request.headers.remove(name);
+        }
     }
 
     // Step 12
@@ -817,7 +905,13 @@ pub fn http_redirect_fetch(
     request.url_list.push(location_url);
 
     // Step 14
-    // TODO implement referrer policy
+    if let Some(referrer_policy) = response
+        .actual_response()
+        .headers
+        .typed_get::<headers::ReferrerPolicy>()
+    {
+        request.referrer_policy = Some(referrer_policy.into());
+    }
 
     // Step 15
     let recursive_flag = request.redirect_mode != RedirectMode::Manual;
@@ -879,8 +973,7 @@ fn http_network_or_cache_fetch(
     let http_request = if request_has_no_window && request.redirect_mode == RedirectMode::Error {
         request
     } else {
-        // Step 5.2
-        // TODO Implement body source
+        // Step 5.2.1, .2.2 and .2.3 and 2.4
         http_request = request.clone();
         &mut http_request
     };
@@ -904,7 +997,7 @@ fn http_network_or_cache_fetch(
             _ => None,
         },
         // Step 5.6
-        Some(ref http_request_body) => Some(http_request_body.len() as u64),
+        Some(ref http_request_body) => http_request_body.len().map(|size| size as u64),
     };
 
     // Step 5.7
@@ -1258,7 +1351,74 @@ fn http_network_or_cache_fetch(
     // TODO: if necessary set response's range-requested flag
 
     // Step 9
-    // TODO: handle CORS not set and cross-origin blocked
+    // https://fetch.spec.whatwg.org/#cross-origin-resource-policy-check
+    #[derive(PartialEq)]
+    enum CrossOriginResourcePolicy {
+        Allowed,
+        Blocked,
+    }
+
+    fn cross_origin_resource_policy_check(
+        request: &Request,
+        response: &Response,
+    ) -> CrossOriginResourcePolicy {
+        // Step 1
+        if request.mode != RequestMode::NoCors {
+            return CrossOriginResourcePolicy::Allowed;
+        }
+
+        // Step 2
+        let current_url_origin = request.current_url().origin();
+        let same_origin = if let Origin::Origin(ref origin) = request.origin {
+            *origin == request.current_url().origin()
+        } else {
+            false
+        };
+
+        if same_origin {
+            return CrossOriginResourcePolicy::Allowed;
+        }
+
+        // Step 3
+        let policy = response
+            .headers
+            .get(HeaderName::from_static("cross-origin-resource-policy"))
+            .map(|h| h.to_str().unwrap_or(""))
+            .unwrap_or("");
+
+        // Step 4
+        if policy == "same-origin" {
+            return CrossOriginResourcePolicy::Blocked;
+        }
+
+        // Step 5
+        if let Origin::Origin(ref request_origin) = request.origin {
+            let schemeless_same_origin =
+                is_schemelessy_same_site(&request_origin, &current_url_origin);
+            if schemeless_same_origin &&
+                (request_origin.scheme() == Some("https") ||
+                    response.https_state == HttpsState::None)
+            {
+                return CrossOriginResourcePolicy::Allowed;
+            }
+        };
+
+        // Step 6
+        if policy == "same-site" {
+            return CrossOriginResourcePolicy::Blocked;
+        }
+
+        CrossOriginResourcePolicy::Allowed
+    }
+
+    if http_request.response_tainting != ResponseTainting::CorsTainting &&
+        cross_origin_resource_policy_check(&http_request, &response) ==
+            CrossOriginResourcePolicy::Blocked
+    {
+        return Response::network_error(NetworkError::Internal(
+            "Cross-origin resource policy check failed".into(),
+        ));
+    }
 
     // Step 10
     // FIXME: Figure out what to do with request window objects
@@ -1354,7 +1514,7 @@ impl Drop for ResponseEndTimer {
 
 /// [HTTP network fetch](https://fetch.spec.whatwg.org/#http-network-fetch)
 fn http_network_fetch(
-    request: &Request,
+    request: &mut Request,
     credentials_flag: bool,
     done_chan: &mut DoneChannel,
     context: &FetchContext,
@@ -1397,10 +1557,8 @@ fn http_network_fetch(
         &url,
         &request.method,
         &request.headers,
-        &request.body,
-        &request.method,
+        request.body.as_mut().and_then(|body| body.take_stream()),
         &request.pipeline_id,
-        request.redirect_count + 1,
         request_id.as_ref().map(Deref::deref),
         is_xhr,
         context,
@@ -1512,7 +1670,7 @@ fn http_network_fetch(
     let timing_ptr3 = context.timing.clone();
     let url1 = request.url();
     let url2 = url1.clone();
-    HANDLE.lock().unwrap().spawn(
+    HANDLE.lock().unwrap().as_mut().unwrap().spawn(
         res.into_body()
             .map_err(|_| ())
             .fold(res_body, move |res_body, chunk| {

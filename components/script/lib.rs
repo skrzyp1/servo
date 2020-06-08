@@ -2,12 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![feature(box_into_raw_non_null)]
 #![feature(const_fn)]
-#![feature(const_transmute)]
 #![feature(core_intrinsics)]
 #![feature(drain_filter)]
-#![feature(inner_deref)]
 #![feature(plugin)]
 #![feature(register_tool)]
 #![deny(unsafe_code)]
@@ -50,6 +47,8 @@ extern crate servo_atoms;
 #[macro_use]
 extern crate style;
 
+mod animation_timeline;
+mod animations;
 #[warn(deprecated)]
 #[macro_use]
 mod task;
@@ -91,9 +90,7 @@ pub mod script_runtime;
 #[allow(unsafe_code)]
 pub mod script_thread;
 #[warn(deprecated)]
-mod serviceworker_manager;
-#[warn(deprecated)]
-mod serviceworkerjob;
+pub mod serviceworker_manager;
 #[warn(deprecated)]
 mod stylesheet_loader;
 #[warn(deprecated)]
@@ -115,7 +112,7 @@ mod unpremultiplytable;
 #[warn(deprecated)]
 mod webdriver_handlers;
 
-pub use init::{init, init_service_workers};
+pub use init::init;
 pub use script_runtime::JSEngineSetup;
 
 /// A module with everything layout can use from script.
@@ -130,8 +127,8 @@ pub mod layout_exports {
     pub use crate::dom::bindings::inheritance::{HTMLElementTypeId, NodeTypeId, TextTypeId};
     pub use crate::dom::bindings::root::LayoutDom;
     pub use crate::dom::characterdata::LayoutCharacterDataHelpers;
-    pub use crate::dom::document::{Document, LayoutDocumentHelpers, PendingRestyle};
-    pub use crate::dom::element::{Element, LayoutElementHelpers, RawLayoutElementHelpers};
+    pub use crate::dom::document::{Document, LayoutDocumentHelpers};
+    pub use crate::dom::element::{Element, LayoutElementHelpers};
     pub use crate::dom::node::NodeFlags;
     pub use crate::dom::node::{LayoutNodeHelpers, Node};
     pub use crate::dom::shadowroot::{LayoutShadowRootHelpers, ShadowRoot};

@@ -86,6 +86,10 @@ dictionary TestDictionaryDefaults {
   object? nullableObjectValue = null;
 };
 
+dictionary TestURLLike {
+  required DOMString href;
+};
+
 [Pref="dom.testbinding.enabled",
  Exposed=(Window,Worker)
 ]
@@ -278,6 +282,10 @@ interface TestBinding {
 
   void passOverloaded(ArrayBuffer arg);
   void passOverloaded(DOMString arg);
+
+  // https://github.com/servo/servo/pull/26154
+  DOMString passOverloadedDict(Node arg);
+  DOMString passOverloadedDict(TestURLLike arg);
 
   void passNullableBoolean(boolean? arg);
   void passNullableByte(byte? arg);
@@ -509,7 +517,7 @@ interface TestBinding {
   [Pref="dom.testbinding.prefcontrolled.enabled"]
   const unsigned short prefControlledConstDisabled = 0;
   [Pref="layout.animations.test.enabled"]
-  void advanceClock(long millis, optional boolean forceLayoutTick = true);
+  void advanceClock(long millis);
 
   [Pref="dom.testbinding.prefcontrolled2.enabled"]
   readonly attribute boolean prefControlledAttributeEnabled;

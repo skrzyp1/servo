@@ -7,8 +7,8 @@
 use crate::HTMLCanvasData;
 use crate::HTMLMediaData;
 use crate::LayoutNodeType;
-use crate::OpaqueStyleAndLayoutData;
 use crate::SVGSVGData;
+use crate::StyleAndOpaqueLayoutData;
 use atomic_refcell::AtomicRef;
 use gfx_traits::{combine_id_with_fragment_type, ByteIndex, FragmentType};
 use html5ever::{LocalName, Namespace};
@@ -17,6 +17,7 @@ use net_traits::image::base::{Image, ImageMetadata};
 use range::Range;
 use servo_arc::Arc;
 use servo_url::ServoUrl;
+use std::borrow::Cow;
 use std::fmt::Debug;
 use std::sync::Arc as StdArc;
 use style::attr::AttrValue;
@@ -78,22 +79,22 @@ impl PseudoElementType {
 }
 
 /// Trait to abstract access to layout data across various data structures.
-pub trait GetLayoutData {
-    fn get_style_and_layout_data(&self) -> Option<OpaqueStyleAndLayoutData>;
+pub trait GetStyleAndOpaqueLayoutData<'dom> {
+    fn get_style_and_opaque_layout_data(self) -> Option<&'dom StyleAndOpaqueLayoutData>;
 }
 
 /// A wrapper so that layout can access only the methods that it should have access to. Layout must
 /// only ever see these and must never see instances of `LayoutDom`.
-pub trait LayoutNode: Debug + GetLayoutData + TNode {
-    type ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode;
+pub trait LayoutNode<'dom>: Debug + GetStyleAndOpaqueLayoutData<'dom> + TNode {
+    type ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode<'dom>;
     fn to_threadsafe(&self) -> Self::ConcreteThreadSafeLayoutNode;
 
     /// Returns the type ID of this node.
     fn type_id(&self) -> LayoutNodeType;
 
     unsafe fn initialize_data(&self);
-    unsafe fn init_style_and_layout_data(&self, data: OpaqueStyleAndLayoutData);
-    unsafe fn take_style_and_layout_data(&self) -> OpaqueStyleAndLayoutData;
+    unsafe fn init_style_and_opaque_layout_data(&self, data: Box<StyleAndOpaqueLayoutData>);
+    unsafe fn take_style_and_opaque_layout_data(&self) -> Box<StyleAndOpaqueLayoutData>;
 
     fn rev_children(self) -> LayoutIterator<ReverseChildrenIterator<Self>> {
         LayoutIterator(ReverseChildrenIterator {
@@ -109,16 +110,13 @@ pub trait LayoutNode: Debug + GetLayoutData + TNode {
     fn is_connected(&self) -> bool;
 }
 
-pub struct ReverseChildrenIterator<ConcreteNode>
-where
-    ConcreteNode: LayoutNode,
-{
+pub struct ReverseChildrenIterator<ConcreteNode> {
     current: Option<ConcreteNode>,
 }
 
-impl<ConcreteNode> Iterator for ReverseChildrenIterator<ConcreteNode>
+impl<'dom, ConcreteNode> Iterator for ReverseChildrenIterator<ConcreteNode>
 where
-    ConcreteNode: LayoutNode,
+    ConcreteNode: LayoutNode<'dom>,
 {
     type Item = ConcreteNode;
     fn next(&mut self) -> Option<ConcreteNode> {
@@ -128,16 +126,13 @@ where
     }
 }
 
-pub struct TreeIterator<ConcreteNode>
-where
-    ConcreteNode: LayoutNode,
-{
+pub struct TreeIterator<ConcreteNode> {
     stack: Vec<ConcreteNode>,
 }
 
-impl<ConcreteNode> TreeIterator<ConcreteNode>
+impl<'dom, ConcreteNode> TreeIterator<ConcreteNode>
 where
-    ConcreteNode: LayoutNode,
+    ConcreteNode: LayoutNode<'dom>,
 {
     fn new(root: ConcreteNode) -> TreeIterator<ConcreteNode> {
         let mut stack = vec![];
@@ -150,9 +145,9 @@ where
     }
 }
 
-impl<ConcreteNode> Iterator for TreeIterator<ConcreteNode>
+impl<'dom, ConcreteNode> Iterator for TreeIterator<ConcreteNode>
 where
-    ConcreteNode: LayoutNode,
+    ConcreteNode: LayoutNode<'dom>,
 {
     type Item = ConcreteNode;
     fn next(&mut self) -> Option<ConcreteNode> {
@@ -164,13 +159,13 @@ where
 
 /// A thread-safe version of `LayoutNode`, used during flow construction. This type of layout
 /// node does not allow any parents or siblings of nodes to be accessed, to avoid races.
-pub trait ThreadSafeLayoutNode:
-    Clone + Copy + Debug + GetLayoutData + NodeInfo + PartialEq + Sized
+pub trait ThreadSafeLayoutNode<'dom>:
+    Clone + Copy + Debug + GetStyleAndOpaqueLayoutData<'dom> + NodeInfo + PartialEq + Sized
 {
-    type ConcreteNode: LayoutNode<ConcreteThreadSafeLayoutNode = Self>;
+    type ConcreteNode: LayoutNode<'dom, ConcreteThreadSafeLayoutNode = Self>;
     type ConcreteElement: TElement;
 
-    type ConcreteThreadSafeLayoutElement: ThreadSafeLayoutElement<ConcreteThreadSafeLayoutNode = Self>
+    type ConcreteThreadSafeLayoutElement: ThreadSafeLayoutElement<'dom, ConcreteThreadSafeLayoutNode = Self>
         + ::selectors::Element<Impl = SelectorImpl>;
     type ChildrenIterator: Iterator<Item = Self> + Sized;
 
@@ -229,7 +224,7 @@ pub trait ThreadSafeLayoutNode:
             .map_or(PseudoElementType::Normal, |el| el.get_pseudo_element_type())
     }
 
-    fn get_style_and_layout_data(&self) -> Option<OpaqueStyleAndLayoutData>;
+    fn get_style_and_opaque_layout_data(self) -> Option<&'dom StyleAndOpaqueLayoutData>;
 
     fn style(&self, context: &SharedStyleContext) -> Arc<ComputedValues> {
         if let Some(el) = self.as_element() {
@@ -268,7 +263,7 @@ pub trait ThreadSafeLayoutNode:
     /// data flags, and we have this annoying trait separation between script and layout :-(
     unsafe fn unsafe_get(self) -> Self::ConcreteNode;
 
-    fn node_text_content(&self) -> String;
+    fn node_text_content(self) -> Cow<'dom, str>;
 
     /// If the insertion point is within this node, returns it. Otherwise, returns `None`.
     fn selection(&self) -> Option<Range<ByteIndex>>;
@@ -313,15 +308,23 @@ pub trait ThreadSafeLayoutNode:
 // This trait is only public so that it can be implemented by the gecko wrapper.
 // It can be used to violate thread-safety, so don't use it elsewhere in layout!
 #[allow(unsafe_code)]
-pub trait DangerousThreadSafeLayoutNode: ThreadSafeLayoutNode {
+pub trait DangerousThreadSafeLayoutNode<'dom>: ThreadSafeLayoutNode<'dom> {
     unsafe fn dangerous_first_child(&self) -> Option<Self>;
     unsafe fn dangerous_next_sibling(&self) -> Option<Self>;
 }
 
-pub trait ThreadSafeLayoutElement:
-    Clone + Copy + Sized + Debug + ::selectors::Element<Impl = SelectorImpl> + GetLayoutData
+pub trait ThreadSafeLayoutElement<'dom>:
+    Clone
+    + Copy
+    + Sized
+    + Debug
+    + ::selectors::Element<Impl = SelectorImpl>
+    + GetStyleAndOpaqueLayoutData<'dom>
 {
-    type ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode<ConcreteThreadSafeLayoutElement = Self>;
+    type ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode<
+        'dom,
+        ConcreteThreadSafeLayoutElement = Self,
+    >;
 
     /// This type alias is just a work-around to avoid writing
     ///

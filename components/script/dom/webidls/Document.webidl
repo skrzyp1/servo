@@ -124,7 +124,7 @@ partial /*sealed*/ interface Document {
   [CEReactions, Throws]
   Document open(optional DOMString unused1, optional DOMString unused2);
   [CEReactions, Throws]
-  WindowProxy open(USVString url, DOMString name, DOMString features);
+  WindowProxy? open(USVString url, DOMString name, DOMString features);
   [CEReactions, Throws]
   void close();
   [CEReactions, Throws]
@@ -142,7 +142,7 @@ partial /*sealed*/ interface Document {
   // boolean queryCommandEnabled(DOMString commandId);
   // boolean queryCommandIndeterm(DOMString commandId);
   // boolean queryCommandState(DOMString commandId);
-  // boolean queryCommandSupported(DOMString commandId);
+  boolean queryCommandSupported(DOMString commandId);
   // DOMString queryCommandValue(DOMString commandId);
 
   // special event handler IDL attributes that only apply to Document objects
@@ -185,19 +185,6 @@ partial interface Document {
 
   // Tracking issue for document.all: https://github.com/servo/servo/issues/7396
   // readonly attribute HTMLAllCollection all;
-};
-
-// http://w3c.github.io/touch-events/#idl-def-Document
-partial interface Document {
-      Touch createTouch(Window/*Proxy*/ view,
-                        EventTarget target,
-                        long identifier,
-                        double pageX,
-                        double pageY,
-                        double screenX,
-                        double screenY);
-
-      TouchList createTouchList(Touch... touches);
 };
 
 // https://fullscreen.spec.whatwg.org/#api

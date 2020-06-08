@@ -9,7 +9,7 @@ use crate::flow::FlowLayout;
 use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragments::{
     AbsoluteOrFixedPositionedFragment, AnonymousFragment, BoxFragment, CollapsedBlockMargins,
-    DebugId, Fragment, TextFragment,
+    DebugId, FontMetrics, Fragment, Tag, TextFragment,
 };
 use crate::geom::flow_relative::{Rect, Sides, Vec2};
 use crate::positioned::{
@@ -22,16 +22,17 @@ use crate::ContainingBlock;
 use app_units::Au;
 use gfx::text::text_run::GlyphRun;
 use servo_arc::Arc;
-use style::dom::OpaqueNode;
 use style::properties::ComputedValues;
 use style::values::computed::{Length, LengthPercentage, Percentage};
 use style::values::specified::text::TextAlignKeyword;
+use style::values::specified::text::TextDecorationLine;
 use style::Zero;
 use webrender_api::FontInstanceKey;
 
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct InlineFormattingContext {
     pub(super) inline_level_boxes: Vec<ArcRefCell<InlineLevelBox>>,
+    pub(super) text_decoration_line: TextDecorationLine,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,7 +46,7 @@ pub(crate) enum InlineLevelBox {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct InlineBox {
-    pub tag: OpaqueNode,
+    pub tag: Tag,
     #[serde(skip_serializing)]
     pub style: Arc<ComputedValues>,
     pub first_fragment: bool,
@@ -56,7 +57,7 @@ pub(crate) struct InlineBox {
 /// https://www.w3.org/TR/css-display-3/#css-text-run
 #[derive(Debug, Serialize)]
 pub(crate) struct TextRun {
-    pub tag: OpaqueNode,
+    pub tag: Tag,
     #[serde(skip_serializing)]
     pub parent_style: Arc<ComputedValues>,
     pub text: String,
@@ -68,10 +69,15 @@ struct InlineNestingLevelState<'box_tree> {
     inline_start: Length,
     max_block_size_of_fragments_so_far: Length,
     positioning_context: Option<PositioningContext>,
+    /// Indicates whether this nesting level have text decorations in effect.
+    /// From https://drafts.csswg.org/css-text-decor/#line-decoration
+    // "When specified on or propagated to a block container that establishes
+    //  an IFC..."
+    text_decoration_line: TextDecorationLine,
 }
 
 struct PartialInlineBoxFragment<'box_tree> {
-    tag: OpaqueNode,
+    tag: Tag,
     style: Arc<ComputedValues>,
     start_corner: Vec2<Length>,
     padding: Sides<Length>,
@@ -122,6 +128,13 @@ struct Lines {
 }
 
 impl InlineFormattingContext {
+    pub(super) fn new(text_decoration_line: TextDecorationLine) -> InlineFormattingContext {
+        InlineFormattingContext {
+            inline_level_boxes: Default::default(),
+            text_decoration_line,
+        }
+    }
+
     // This works on an already-constructed `InlineFormattingContext`,
     // Which would have to change if/when
     // `BlockContainer::construct` parallelize their construction.
@@ -192,7 +205,7 @@ impl InlineFormattingContext {
                 }
             }
 
-            fn add_lengthpercentage(&mut self, lp: LengthPercentage) {
+            fn add_lengthpercentage(&mut self, lp: &LengthPercentage) {
                 if let Some(l) = lp.to_length() {
                     self.add_length(l);
                 }
@@ -256,8 +269,10 @@ impl InlineFormattingContext {
                 inline_start: Length::zero(),
                 max_block_size_of_fragments_so_far: Length::zero(),
                 positioning_context: None,
+                text_decoration_line: self.text_decoration_line,
             },
         };
+
         loop {
             if let Some(child) = ifc.current_nesting_level.remaining_boxes.next() {
                 match &*child.borrow() {
@@ -287,13 +302,20 @@ impl InlineFormattingContext {
                                     panic!("display:none does not generate an abspos box")
                                 },
                             };
-                        let hoisted_box = box_.clone().to_hoisted(initial_start_corner, tree_rank);
-                        let hoisted_fragment_id = hoisted_box.fragment_id;
+                        let hoisted_box = AbsolutelyPositionedBox::to_hoisted(
+                            box_.clone(),
+                            initial_start_corner,
+                            tree_rank,
+                        );
+                        let hoisted_fragment = hoisted_box.fragment.clone();
                         ifc.push_hoisted_box_to_positioning_context(hoisted_box);
                         ifc.current_nesting_level.fragments_so_far.push(
-                            Fragment::AbsoluteOrFixedPositioned(AbsoluteOrFixedPositionedFragment(
-                                hoisted_fragment_id,
-                            )),
+                            Fragment::AbsoluteOrFixedPositioned(
+                                AbsoluteOrFixedPositionedFragment {
+                                    hoisted_fragment,
+                                    position: box_.contents.style.clone_position(),
+                                },
+                            ),
                         );
                     },
                     InlineLevelBox::OutOfFlowFloatBox(_box_) => {
@@ -385,6 +407,7 @@ impl Lines {
             block: line_block_size,
         };
         self.next_line_block_position += size.block;
+
         self.fragments
             .push(Fragment::Anonymous(AnonymousFragment::new(
                 Rect { start_corner, size },
@@ -401,13 +424,11 @@ impl InlineBox {
         ifc: &mut InlineFormattingContextState<'box_tree, '_, '_>,
     ) -> PartialInlineBoxFragment<'box_tree> {
         let style = self.style.clone();
-        let cbis = ifc.containing_block.inline_size;
-        let mut padding = style.padding().percentages_relative_to(cbis);
-        let mut border = style.border_width();
-        let mut margin = style
-            .margin()
-            .percentages_relative_to(cbis)
-            .auto_is(Length::zero);
+        let pbm = style.padding_border_margin(&ifc.containing_block);
+        let mut padding = pbm.padding;
+        let mut border = pbm.border;
+        let mut margin = pbm.margin.auto_is(Length::zero);
+
         if self.first_fragment {
             ifc.inline_position += padding.inline_start + border.inline_start + margin.inline_start;
         } else {
@@ -423,6 +444,8 @@ impl InlineBox {
             start_corner += &relative_adjustement(&style, ifc.containing_block)
         }
         let positioning_context = PositioningContext::new_for_style(&style);
+        let text_decoration_line =
+            ifc.current_nesting_level.text_decoration_line | style.clone_text_decoration_line();
         PartialInlineBoxFragment {
             tag: self.tag,
             style,
@@ -441,6 +464,7 @@ impl InlineBox {
                     inline_start: ifc.inline_position,
                     max_block_size_of_fragments_so_far: Length::zero(),
                     positioning_context,
+                    text_decoration_line: text_decoration_line,
                 },
             ),
         }
@@ -472,7 +496,6 @@ impl<'box_tree> PartialInlineBoxFragment<'box_tree> {
             self.border.clone(),
             self.margin.clone(),
             CollapsedBlockMargins::zero(),
-            None, // hoisted_fragment_id
         );
         let last_fragment = self.last_box_tree_fragment && !at_line_break;
         if last_fragment {
@@ -508,18 +531,12 @@ fn layout_atomic(
     ifc: &mut InlineFormattingContextState,
     atomic: &IndependentFormattingContext,
 ) {
-    let cbis = ifc.containing_block.inline_size;
-    let padding = atomic.style.padding().percentages_relative_to(cbis);
-    let border = atomic.style.border_width();
-    let margin = atomic
-        .style
-        .margin()
-        .percentages_relative_to(cbis)
-        .auto_is(Length::zero);
-    let pbm = &(&padding + &border) + &margin;
-    ifc.inline_position += pbm.inline_start;
+    let pbm = atomic.style.padding_border_margin(&ifc.containing_block);
+    let margin = pbm.margin.auto_is(Length::zero);
+    let pbm_sums = &(&pbm.padding + &pbm.border) + &margin;
+    ifc.inline_position += pbm_sums.inline_start;
     let mut start_corner = Vec2 {
-        block: pbm.block_start,
+        block: pbm_sums.block_start,
         inline: ifc.inline_position - ifc.current_nesting_level.inline_start,
     };
     if atomic.style.clone_position().is_relative() {
@@ -528,7 +545,8 @@ fn layout_atomic(
 
     let fragment = match atomic.as_replaced() {
         Ok(replaced) => {
-            let size = replaced.used_size_as_if_inline_element(ifc.containing_block, &atomic.style);
+            let size =
+                replaced.used_size_as_if_inline_element(ifc.containing_block, &atomic.style, &pbm);
             let fragments = replaced.make_fragments(&atomic.style, size.clone());
             let content_rect = Rect { start_corner, size };
             BoxFragment::new(
@@ -536,31 +554,27 @@ fn layout_atomic(
                 atomic.style.clone(),
                 fragments,
                 content_rect,
-                padding,
-                border,
+                pbm.padding,
+                pbm.border,
                 margin,
                 CollapsedBlockMargins::zero(),
-                None, // hoisted_fragment_id
             )
         },
         Err(non_replaced) => {
-            let box_size = atomic.style.box_size();
+            let box_size = atomic.style.content_box_size(&ifc.containing_block, &pbm);
             let max_box_size = atomic
                 .style
-                .max_box_size()
-                .percentages_relative_to(ifc.containing_block);
+                .content_max_box_size(&ifc.containing_block, &pbm);
             let min_box_size = atomic
                 .style
-                .min_box_size()
-                .percentages_relative_to(ifc.containing_block)
+                .content_min_box_size(&ifc.containing_block, &pbm)
                 .auto_is(Length::zero);
 
             // https://drafts.csswg.org/css2/visudet.html#inlineblock-width
-            let tentative_inline_size =
-                box_size.inline.percentage_relative_to(cbis).auto_is(|| {
-                    let available_size = cbis - pbm.inline_sum();
-                    atomic.content_sizes.shrink_to_fit(available_size)
-                });
+            let tentative_inline_size = box_size.inline.auto_is(|| {
+                let available_size = ifc.containing_block.inline_size - pbm_sums.inline_sum();
+                atomic.content_sizes.shrink_to_fit(available_size)
+            });
 
             // https://drafts.csswg.org/css2/visudet.html#min-max-widths
             // In this case “applying the rules above again” with a non-auto inline-size
@@ -568,12 +582,9 @@ fn layout_atomic(
             let inline_size = tentative_inline_size
                 .clamp_between_extremums(min_box_size.inline, max_box_size.inline);
 
-            let block_size = box_size
-                .block
-                .maybe_percentage_relative_to(ifc.containing_block.block_size.non_auto());
             let containing_block_for_children = ContainingBlock {
                 inline_size,
-                block_size,
+                block_size: box_size.block,
                 style: &atomic.style,
             };
             assert_eq!(
@@ -592,7 +603,9 @@ fn layout_atomic(
             );
 
             // https://drafts.csswg.org/css2/visudet.html#block-root-margin
-            let tentative_block_size = block_size.auto_is(|| independent_layout.content_block_size);
+            let tentative_block_size = box_size
+                .block
+                .auto_is(|| independent_layout.content_block_size);
 
             // https://drafts.csswg.org/css2/visudet.html#min-max-heights
             // In this case “applying the rules above again” with a non-auto block-size
@@ -612,27 +625,25 @@ fn layout_atomic(
                 atomic.style.clone(),
                 independent_layout.fragments,
                 content_rect,
-                padding,
-                border,
+                pbm.padding,
+                pbm.border,
                 margin,
                 CollapsedBlockMargins::zero(),
-                None, // hoisted_fragment_id
             )
         },
     };
 
-    ifc.inline_position += pbm.inline_end + fragment.content_rect.size.inline;
+    ifc.inline_position += pbm_sums.inline_end + fragment.content_rect.size.inline;
     ifc.current_nesting_level
         .max_block_size_of_fragments_so_far
-        .max_assign(pbm.block_sum() + fragment.content_rect.size.block);
+        .max_assign(pbm_sums.block_sum() + fragment.content_rect.size.block);
     ifc.current_nesting_level
         .fragments_so_far
         .push(Fragment::Box(fragment));
 }
 
 struct BreakAndShapeResult {
-    font_ascent: Au,
-    font_line_gap: Au,
+    font_metrics: FontMetrics,
     font_key: FontInstanceKey,
     runs: Vec<GlyphRun>,
     break_at_start: bool,
@@ -699,8 +710,7 @@ impl TextRun {
             );
 
             BreakAndShapeResult {
-                font_ascent: font.metrics.ascent,
-                font_line_gap: font.metrics.line_gap,
+                font_metrics: (&font.metrics).into(),
                 font_key: font.font_key,
                 runs,
                 break_at_start,
@@ -712,8 +722,7 @@ impl TextRun {
         use style::values::generics::text::LineHeight;
 
         let BreakAndShapeResult {
-            font_ascent,
-            font_line_gap,
+            font_metrics,
             font_key,
             runs,
             break_at_start: _,
@@ -750,7 +759,7 @@ impl TextRun {
                 }
             }
             let line_height = match self.parent_style.get_inherited_text().line_height {
-                LineHeight::Normal => font_line_gap.into(),
+                LineHeight::Normal => font_metrics.line_gap,
                 LineHeight::Number(n) => font_size * n.0,
                 LineHeight::Length(l) => l.0,
             };
@@ -775,11 +784,12 @@ impl TextRun {
                     debug_id: DebugId::new(),
                     parent_style: self.parent_style.clone(),
                     rect,
-                    ascent: font_ascent.into(),
+                    font_metrics,
                     font_key,
                     glyphs,
+                    text_decoration_line: ifc.current_nesting_level.text_decoration_line,
                 }));
-            if runs.is_empty() {
+            if runs.as_slice().is_empty() {
                 break;
             } else {
                 // New line

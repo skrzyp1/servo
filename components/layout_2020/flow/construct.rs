@@ -4,32 +4,45 @@
 
 use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
-use crate::dom_traversal::{BoxSlot, Contents, NodeExt, NonReplacedContents, TraversalHandler};
+use crate::dom_traversal::{
+    BoxSlot, Contents, NodeAndStyleInfo, NodeExt, NonReplacedContents, TraversalHandler,
+};
 use crate::element_data::LayoutBox;
 use crate::flow::float::FloatBox;
 use crate::flow::inline::{InlineBox, InlineFormattingContext, InlineLevelBox, TextRun};
 use crate::flow::{BlockContainer, BlockFormattingContext, BlockLevelBox};
 use crate::formatting_contexts::IndependentFormattingContext;
+use crate::fragments::Tag;
 use crate::positioned::AbsolutelyPositionedBox;
 use crate::sizing::{BoxContentSizes, ContentSizes, ContentSizesRequest};
 use crate::style_ext::{ComputedValuesExt, DisplayGeneratingBox, DisplayInside, DisplayOutside};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon_croissant::ParallelIteratorExt;
 use servo_arc::Arc;
+use std::borrow::Cow;
 use std::convert::{TryFrom, TryInto};
 use style::properties::ComputedValues;
 use style::selector_parser::PseudoElement;
+use style::values::specified::text::TextDecorationLine;
 
 impl BlockFormattingContext {
-    pub fn construct<'dom>(
+    pub fn construct<'dom, Node>(
         context: &LayoutContext,
-        node: impl NodeExt<'dom>,
-        style: &Arc<ComputedValues>,
+        info: &NodeAndStyleInfo<Node>,
         contents: NonReplacedContents,
         content_sizes: ContentSizesRequest,
-    ) -> (Self, BoxContentSizes) {
-        let (contents, contains_floats, inline_content_sizes) =
-            BlockContainer::construct(context, node, style, contents, content_sizes);
+        propagated_text_decoration_line: TextDecorationLine,
+    ) -> (Self, BoxContentSizes)
+    where
+        Node: NodeExt<'dom>,
+    {
+        let (contents, contains_floats, inline_content_sizes) = BlockContainer::construct(
+            context,
+            info,
+            contents,
+            content_sizes,
+            propagated_text_decoration_line,
+        );
         // FIXME: add contribution to `inline_content_sizes` of floats in this formatting context
         // https://dbaron.org/css/intrinsic/#intrinsic
         let bfc = Self {
@@ -38,12 +51,35 @@ impl BlockFormattingContext {
         };
         (bfc, inline_content_sizes)
     }
+
+    pub fn construct_for_text_runs<'dom>(
+        context: &LayoutContext,
+        runs: impl Iterator<Item = TextRun>,
+        content_sizes: ContentSizesRequest,
+        text_decoration_line: TextDecorationLine,
+    ) -> (Self, BoxContentSizes) {
+        // FIXME: do white space collapsing
+        let inline_level_boxes = runs
+            .map(|run| ArcRefCell::new(InlineLevelBox::TextRun(run)))
+            .collect();
+
+        let ifc = InlineFormattingContext {
+            inline_level_boxes,
+            text_decoration_line,
+        };
+        let content_sizes = content_sizes.compute(|| ifc.inline_content_sizes(context));
+        let contents = BlockContainer::InlineFormattingContext(ifc);
+        let bfc = Self {
+            contents,
+            contains_floats: false,
+        };
+        (bfc, content_sizes)
+    }
 }
 
 struct BlockLevelJob<'dom, Node> {
-    node: Node,
+    info: NodeAndStyleInfo<Node>,
     box_slot: BoxSlot<'dom>,
-    style: Arc<ComputedValues>,
     kind: BlockLevelCreator,
 }
 
@@ -52,6 +88,7 @@ enum BlockLevelCreator {
     Independent {
         display_inside: DisplayInside,
         contents: Contents,
+        propagated_text_decoration_line: TextDecorationLine,
     },
     OutOfFlowAbsolutelyPositionedBox {
         display_inside: DisplayInside,
@@ -72,7 +109,7 @@ enum BlockLevelCreator {
 /// Deferring allows using rayon’s `into_par_iter`.
 enum IntermediateBlockContainer {
     InlineFormattingContext(InlineFormattingContext),
-    Deferred(NonReplacedContents),
+    Deferred(NonReplacedContents, TextDecorationLine),
 }
 
 /// A builder for a block container.
@@ -82,9 +119,9 @@ enum IntermediateBlockContainer {
 struct BlockContainerBuilder<'dom, 'style, Node> {
     context: &'style LayoutContext<'style>,
 
-    root: Node,
-
-    block_container_style: &'style Arc<ComputedValues>,
+    /// This NodeAndStyleInfo contains the root node, the corresponding pseudo
+    /// content designator, and the block container style.
+    info: &'style NodeAndStyleInfo<Node>,
 
     /// The list of block-level boxes to be built for the final block container.
     ///
@@ -134,25 +171,29 @@ struct BlockContainerBuilder<'dom, 'style, Node> {
 }
 
 impl BlockContainer {
-    pub fn construct<'dom>(
+    pub fn construct<'dom, Node>(
         context: &LayoutContext,
-        root: impl NodeExt<'dom>,
-        block_container_style: &Arc<ComputedValues>,
+        info: &NodeAndStyleInfo<Node>,
         contents: NonReplacedContents,
         content_sizes: ContentSizesRequest,
-    ) -> (BlockContainer, ContainsFloats, BoxContentSizes) {
+        propagated_text_decoration_line: TextDecorationLine,
+    ) -> (BlockContainer, ContainsFloats, BoxContentSizes)
+    where
+        Node: NodeExt<'dom>,
+    {
+        let text_decoration_line =
+            propagated_text_decoration_line | info.style.clone_text_decoration_line();
         let mut builder = BlockContainerBuilder {
             context,
-            root,
-            block_container_style,
+            info,
             block_level_boxes: Vec::new(),
-            ongoing_inline_formatting_context: InlineFormattingContext::default(),
+            ongoing_inline_formatting_context: InlineFormattingContext::new(text_decoration_line),
             ongoing_inline_boxes_stack: Vec::new(),
             anonymous_style: None,
             contains_floats: ContainsFloats::No,
         };
 
-        contents.traverse(context, root, block_container_style, &mut builder);
+        contents.traverse(context, info, &mut builder);
 
         debug_assert!(builder.ongoing_inline_boxes_stack.is_empty());
 
@@ -235,8 +276,7 @@ where
 {
     fn handle_element(
         &mut self,
-        node: Node,
-        style: &Arc<ComputedValues>,
+        info: &NodeAndStyleInfo<Node>,
         display: DisplayGeneratingBox,
         contents: Contents,
         box_slot: BoxSlot<'dom>,
@@ -244,37 +284,25 @@ where
         match display {
             DisplayGeneratingBox::OutsideInside { outside, inside } => match outside {
                 DisplayOutside::Inline => box_slot.set(LayoutBox::InlineLevel(
-                    self.handle_inline_level_element(node, style, inside, contents),
+                    self.handle_inline_level_element(info, inside, contents),
                 )),
                 DisplayOutside::Block => {
-                    let box_style = style.get_box();
+                    let box_style = info.style.get_box();
                     // Floats and abspos cause blockification, so they only happen in this case.
                     // https://drafts.csswg.org/css2/visuren.html#dis-pos-flo
                     if box_style.position.is_absolutely_positioned() {
-                        self.handle_absolutely_positioned_element(
-                            node,
-                            style.clone(),
-                            inside,
-                            contents,
-                            box_slot,
-                        )
+                        self.handle_absolutely_positioned_element(info, inside, contents, box_slot)
                     } else if box_style.float.is_floating() {
-                        self.handle_float_element(node, style.clone(), inside, contents, box_slot)
+                        self.handle_float_element(info, inside, contents, box_slot)
                     } else {
-                        self.handle_block_level_element(
-                            node,
-                            style.clone(),
-                            inside,
-                            contents,
-                            box_slot,
-                        )
+                        self.handle_block_level_element(info, inside, contents, box_slot)
                     }
                 },
             },
         }
     }
 
-    fn handle_text(&mut self, node: Node, input: String, parent_style: &Arc<ComputedValues>) {
+    fn handle_text(&mut self, info: &NodeAndStyleInfo<Node>, input: Cow<'dom, str>) {
         let (leading_whitespace, mut input) = self.handle_leading_whitespace(&input);
         if leading_whitespace || !input.is_empty() {
             // This text node should be pushed either to the next ongoing
@@ -323,10 +351,9 @@ where
             }
 
             if let Some(text) = new_text_run_contents {
-                let parent_style = parent_style.clone();
                 inlines.push(ArcRefCell::new(InlineLevelBox::TextRun(TextRun {
-                    tag: node.as_opaque(),
-                    parent_style,
+                    tag: Tag::from_node_and_style_info(info),
+                    parent_style: Arc::clone(&info.style),
                     text,
                 })))
             }
@@ -399,30 +426,27 @@ where
 
     fn handle_inline_level_element(
         &mut self,
-        node: Node,
-        style: &Arc<ComputedValues>,
+        info: &NodeAndStyleInfo<Node>,
         display_inside: DisplayInside,
         contents: Contents,
     ) -> ArcRefCell<InlineLevelBox> {
+        let style = &info.style;
         let box_ = if display_inside == DisplayInside::Flow && !contents.is_replaced() {
             // We found un inline box.
             // Whatever happened before, all we need to do before recurring
             // is to remember this ongoing inline level box.
             self.ongoing_inline_boxes_stack.push(InlineBox {
-                tag: node.as_opaque(),
-                style: style.clone(),
+                tag: Tag::from_node_and_style_info(info),
+                style: info.style.clone(),
                 first_fragment: true,
                 last_fragment: false,
                 children: vec![],
             });
 
             // `unwrap` doesn’t panic here because `is_replaced` returned `false`.
-            NonReplacedContents::try_from(contents).unwrap().traverse(
-                self.context,
-                node,
-                &style,
-                self,
-            );
+            NonReplacedContents::try_from(contents)
+                .unwrap()
+                .traverse(self.context, info, self);
 
             let mut inline_box = self
                 .ongoing_inline_boxes_stack
@@ -431,14 +455,16 @@ where
             inline_box.last_fragment = true;
             ArcRefCell::new(InlineLevelBox::InlineBox(inline_box))
         } else {
+            let content_sizes = ContentSizesRequest::inline_if(!style.inline_size_is_length());
             ArcRefCell::new(InlineLevelBox::Atomic(
                 IndependentFormattingContext::construct(
                     self.context,
-                    node,
-                    style.clone(),
+                    info,
                     display_inside,
                     contents,
-                    ContentSizesRequest::inline_if(!style.inline_size_is_length()),
+                    content_sizes,
+                    // Text decorations are not propagated to atomic inline-level descendants.
+                    TextDecorationLine::NONE,
                 ),
             ))
         };
@@ -448,8 +474,7 @@ where
 
     fn handle_block_level_element(
         &mut self,
-        node: Node,
-        style: Arc<ComputedValues>,
+        info: &NodeAndStyleInfo<Node>,
         display_inside: DisplayInside,
         contents: Contents,
         box_slot: BoxSlot<'dom>,
@@ -494,6 +519,9 @@ where
                 .push(ArcRefCell::new(fragmented_inline));
         }
 
+        let propagated_text_decoration_line =
+            self.ongoing_inline_formatting_context.text_decoration_line;
+
         // We found a block level element, so the ongoing inline formatting
         // context needs to be ended.
         self.end_ongoing_inline_formatting_context();
@@ -501,11 +529,12 @@ where
         let kind = match contents.try_into() {
             Ok(contents) => match display_inside {
                 DisplayInside::Flow => BlockLevelCreator::SameFormattingContextBlock(
-                    IntermediateBlockContainer::Deferred(contents),
+                    IntermediateBlockContainer::Deferred(contents, propagated_text_decoration_line),
                 ),
                 _ => BlockLevelCreator::Independent {
                     display_inside,
                     contents: contents.into(),
+                    propagated_text_decoration_line,
                 },
             },
             Err(contents) => {
@@ -513,21 +542,20 @@ where
                 BlockLevelCreator::Independent {
                     display_inside,
                     contents,
+                    propagated_text_decoration_line,
                 }
             },
         };
         self.block_level_boxes.push(BlockLevelJob {
-            node,
+            info: info.clone(),
             box_slot,
-            style,
             kind,
         });
     }
 
     fn handle_absolutely_positioned_element(
         &mut self,
-        node: Node,
-        style: Arc<ComputedValues>,
+        info: &NodeAndStyleInfo<Node>,
         display_inside: DisplayInside,
         contents: Contents,
         box_slot: BoxSlot<'dom>,
@@ -538,20 +566,13 @@ where
                 display_inside,
             };
             self.block_level_boxes.push(BlockLevelJob {
-                node,
+                info: info.clone(),
                 box_slot,
-                style,
                 kind,
             });
         } else {
             let box_ = ArcRefCell::new(InlineLevelBox::OutOfFlowAbsolutelyPositionedBox(Arc::new(
-                AbsolutelyPositionedBox::construct(
-                    self.context,
-                    node,
-                    style,
-                    display_inside,
-                    contents,
-                ),
+                AbsolutelyPositionedBox::construct(self.context, info, display_inside, contents),
             )));
             self.current_inline_level_boxes().push(box_.clone());
             box_slot.set(LayoutBox::InlineLevel(box_))
@@ -560,8 +581,7 @@ where
 
     fn handle_float_element(
         &mut self,
-        node: Node,
-        style: Arc<ComputedValues>,
+        info: &NodeAndStyleInfo<Node>,
         display_inside: DisplayInside,
         contents: Contents,
         box_slot: BoxSlot<'dom>,
@@ -574,16 +594,14 @@ where
                 display_inside,
             };
             self.block_level_boxes.push(BlockLevelJob {
-                node,
+                info: info.clone(),
                 box_slot,
-                style,
                 kind,
             });
         } else {
             let box_ = ArcRefCell::new(InlineLevelBox::OutOfFlowFloatBox(FloatBox::construct(
                 self.context,
-                node,
-                style,
+                info,
                 display_inside,
                 contents,
             )));
@@ -603,7 +621,7 @@ where
         }
 
         let context = self.context;
-        let block_container_style = self.block_container_style;
+        let block_container_style = &self.info.style;
         let anonymous_style = self.anonymous_style.get_or_insert_with(|| {
             context
                 .shared_context()
@@ -611,7 +629,7 @@ where
                 .style_for_anonymous::<Node::ConcreteElement>(
                     &context.shared_context().guards,
                     &PseudoElement::ServoText,
-                    &block_container_style,
+                    block_container_style,
                 )
         });
 
@@ -620,11 +638,11 @@ where
                 &mut self.ongoing_inline_formatting_context,
             )),
         );
+        let info = self.info.new_replacing_style(anonymous_style.clone());
         self.block_level_boxes.push(BlockLevelJob {
-            node: self.root,
+            info,
             // FIXME(nox): We should be storing this somewhere.
             box_slot: BoxSlot::dummy(),
-            style: anonymous_style.clone(),
             kind,
         });
     }
@@ -654,44 +672,43 @@ where
         context: &LayoutContext,
         max_assign_in_flow_outer_content_sizes_to: Option<&mut ContentSizes>,
     ) -> (ArcRefCell<BlockLevelBox>, ContainsFloats) {
-        let node = self.node;
-        let style = self.style;
+        let info = &self.info;
         let (block_level_box, contains_floats) = match self.kind {
             BlockLevelCreator::SameFormattingContextBlock(contents) => {
                 let (contents, contains_floats, box_content_sizes) = contents.finish(
                     context,
-                    node,
-                    &style,
+                    info,
                     ContentSizesRequest::inline_if(
                         max_assign_in_flow_outer_content_sizes_to.is_some() &&
-                            !style.inline_size_is_length(),
+                            !info.style.inline_size_is_length(),
                     ),
                 );
                 if let Some(to) = max_assign_in_flow_outer_content_sizes_to {
-                    to.max_assign(&box_content_sizes.outer_inline(&style))
+                    to.max_assign(&box_content_sizes.outer_inline(&info.style))
                 }
                 let block_level_box = ArcRefCell::new(BlockLevelBox::SameFormattingContextBlock {
-                    tag: node.as_opaque(),
+                    tag: Tag::from_node_and_style_info(info),
                     contents,
-                    style,
+                    style: Arc::clone(&info.style),
                 });
                 (block_level_box, contains_floats)
             },
             BlockLevelCreator::Independent {
                 display_inside,
                 contents,
+                propagated_text_decoration_line,
             } => {
                 let content_sizes = ContentSizesRequest::inline_if(
                     max_assign_in_flow_outer_content_sizes_to.is_some() &&
-                        !style.inline_size_is_length(),
+                        !info.style.inline_size_is_length(),
                 );
                 let contents = IndependentFormattingContext::construct(
                     context,
-                    node,
-                    style,
+                    info,
                     display_inside,
                     contents,
                     content_sizes,
+                    propagated_text_decoration_line,
                 );
                 if let Some(to) = max_assign_in_flow_outer_content_sizes_to {
                     to.max_assign(&contents.content_sizes.outer_inline(&contents.style))
@@ -707,13 +724,7 @@ where
             } => {
                 let block_level_box =
                     ArcRefCell::new(BlockLevelBox::OutOfFlowAbsolutelyPositionedBox(Arc::new(
-                        AbsolutelyPositionedBox::construct(
-                            context,
-                            node,
-                            style,
-                            display_inside,
-                            contents,
-                        ),
+                        AbsolutelyPositionedBox::construct(context, info, display_inside, contents),
                     )));
                 (block_level_box, ContainsFloats::No)
             },
@@ -722,7 +733,7 @@ where
                 contents,
             } => {
                 let block_level_box = ArcRefCell::new(BlockLevelBox::OutOfFlowFloatBox(
-                    FloatBox::construct(context, node, style, display_inside, contents),
+                    FloatBox::construct(context, info, display_inside, contents),
                 ));
                 (block_level_box, ContainsFloats::Yes)
             },
@@ -734,16 +745,24 @@ where
 }
 
 impl IntermediateBlockContainer {
-    fn finish<'dom>(
+    fn finish<'dom, Node>(
         self,
         context: &LayoutContext,
-        node: impl NodeExt<'dom>,
-        style: &Arc<ComputedValues>,
+        info: &NodeAndStyleInfo<Node>,
         content_sizes: ContentSizesRequest,
-    ) -> (BlockContainer, ContainsFloats, BoxContentSizes) {
+    ) -> (BlockContainer, ContainsFloats, BoxContentSizes)
+    where
+        Node: NodeExt<'dom>,
+    {
         match self {
-            IntermediateBlockContainer::Deferred(contents) => {
-                BlockContainer::construct(context, node, style, contents, content_sizes)
+            IntermediateBlockContainer::Deferred(contents, propagated_text_decoration_line) => {
+                BlockContainer::construct(
+                    context,
+                    info,
+                    contents,
+                    content_sizes,
+                    propagated_text_decoration_line,
+                )
             },
             IntermediateBlockContainer::InlineFormattingContext(ifc) => {
                 let content_sizes = content_sizes.compute(|| ifc.inline_content_sizes(context));

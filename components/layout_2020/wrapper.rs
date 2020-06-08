@@ -5,17 +5,21 @@
 #![allow(unsafe_code)]
 
 use crate::data::StyleAndLayoutData;
-use script_layout_interface::wrapper_traits::GetLayoutData;
+use script_layout_interface::wrapper_traits::GetStyleAndOpaqueLayoutData;
 
-pub trait GetRawData {
-    fn get_raw_data(&self) -> Option<&StyleAndLayoutData>;
+pub trait GetStyleAndLayoutData<'dom> {
+    fn get_style_and_layout_data(self) -> Option<StyleAndLayoutData<'dom>>;
 }
 
-impl<T: GetLayoutData> GetRawData for T {
-    fn get_raw_data(&self) -> Option<&StyleAndLayoutData> {
-        self.get_style_and_layout_data().map(|opaque| {
-            let container = opaque.ptr.as_ptr() as *mut StyleAndLayoutData;
-            unsafe { &*container }
-        })
+impl<'dom, T> GetStyleAndLayoutData<'dom> for T
+where
+    T: GetStyleAndOpaqueLayoutData<'dom>,
+{
+    fn get_style_and_layout_data(self) -> Option<StyleAndLayoutData<'dom>> {
+        self.get_style_and_opaque_layout_data()
+            .map(|data| StyleAndLayoutData {
+                style_data: &data.style_data,
+                layout_data: data.generic_data.downcast_ref().unwrap(),
+            })
     }
 }

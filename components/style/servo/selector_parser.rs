@@ -19,7 +19,7 @@ use crate::{Atom, CaseSensitivityExt, LocalName, Namespace, Prefix};
 use cssparser::{serialize_identifier, CowRcStr, Parser as CssParser, SourceLocation, ToCss};
 use fxhash::FxHashMap;
 use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
-use selectors::parser::{SelectorParseErrorKind, Visit};
+use selectors::parser::SelectorParseErrorKind;
 use selectors::visitor::SelectorVisitor;
 use std::fmt;
 use std::mem;
@@ -315,6 +315,13 @@ impl ::selectors::parser::NonTSPseudoClass for NonTSPseudoClass {
     fn has_zero_specificity(&self) -> bool {
         false
     }
+
+    fn visit<V>(&self, _: &mut V) -> bool
+    where
+        V: SelectorVisitor<Impl = Self::Impl>,
+    {
+        true
+    }
 }
 
 impl ToCss for NonTSPseudoClass {
@@ -352,17 +359,6 @@ impl ToCss for NonTSPseudoClass {
     }
 }
 
-impl Visit for NonTSPseudoClass {
-    type Impl = SelectorImpl;
-
-    fn visit<V>(&self, _: &mut V) -> bool
-    where
-        V: SelectorVisitor<Impl = Self::Impl>,
-    {
-        true
-    }
-}
-
 impl NonTSPseudoClass {
     /// Gets a given state flag for this pseudo-class. This is used to do
     /// selector matching, and it's set from the DOM.
@@ -394,12 +390,6 @@ impl NonTSPseudoClass {
     /// Returns true if the given pseudoclass should trigger style sharing cache revalidation.
     pub fn needs_cache_revalidation(&self) -> bool {
         self.state_flag().is_empty()
-    }
-
-    /// Returns true if the evaluation of the pseudo-class depends on the
-    /// element's attributes.
-    pub fn is_attr_based(&self) -> bool {
-        matches!(*self, NonTSPseudoClass::Lang(..))
     }
 }
 
@@ -625,15 +615,14 @@ impl DerefMut for SnapshotMap {
 }
 
 /// Servo's version of an element snapshot.
-#[derive(Debug)]
-#[cfg_attr(feature = "servo", derive(MallocSizeOf))]
+#[derive(Debug, Default, MallocSizeOf)]
 pub struct ServoElementSnapshot {
     /// The stored state of the element.
     pub state: Option<ElementState>,
     /// The set of stored attributes and its values.
     pub attrs: Option<Vec<(AttrIdentifier, AttrValue)>>,
-    /// Whether this element is an HTML element in an HTML document.
-    pub is_html_element_in_html_document: bool,
+    /// The set of changed attributes and its values.
+    pub changed_attrs: Vec<LocalName>,
     /// Whether the class attribute changed or not.
     pub class_changed: bool,
     /// Whether the id attribute changed or not.
@@ -644,15 +633,8 @@ pub struct ServoElementSnapshot {
 
 impl ServoElementSnapshot {
     /// Create an empty element snapshot.
-    pub fn new(is_html_element_in_html_document: bool) -> Self {
-        ServoElementSnapshot {
-            state: None,
-            attrs: None,
-            is_html_element_in_html_document: is_html_element_in_html_document,
-            class_changed: false,
-            id_changed: false,
-            other_attributes_changed: false,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Returns whether the id attribute changed or not.
@@ -677,6 +659,17 @@ impl ServoElementSnapshot {
             .iter()
             .find(|&&(ref ident, _)| ident.local_name == *name && ident.namespace == *namespace)
             .map(|&(_, ref v)| v)
+    }
+
+    /// Executes the callback once for each attribute that changed.
+    #[inline]
+    pub fn each_attr_changed<F>(&self, mut callback: F)
+    where
+        F: FnMut(&LocalName),
+    {
+        for name in &self.changed_attrs {
+            callback(name)
+        }
     }
 
     fn any_attr_ignore_ns<F>(&self, name: &LocalName, mut f: F) -> bool
@@ -707,10 +700,6 @@ impl ElementSnapshot for ServoElementSnapshot {
 
     fn is_part(&self, _name: &Atom) -> bool {
         false
-    }
-
-    fn exported_part(&self, _: &Atom) -> Option<Atom> {
-        None
     }
 
     fn imported_part(&self, _: &Atom) -> Option<Atom> {

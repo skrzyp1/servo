@@ -11,7 +11,7 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
-use crate::dom::element::{Element, RawLayoutElementHelpers};
+use crate::dom::element::{Element, LayoutElementHelpers};
 use crate::dom::htmlcollection::{CollectionFilter, HTMLCollection};
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmltablecellelement::HTMLTableCellElement;
@@ -57,12 +57,15 @@ impl HTMLTableRowElement {
         prefix: Option<Prefix>,
         document: &Document,
     ) -> DomRoot<HTMLTableRowElement> {
-        Node::reflect_node(
+        let n = Node::reflect_node(
             Box::new(HTMLTableRowElement::new_inherited(
                 local_name, prefix, document,
             )),
             document,
-        )
+        );
+
+        n.upcast::<Node>().set_weird_parser_insertion_mode();
+        n
     }
 
     /// Determine the index for this `HTMLTableRowElement` within the given
@@ -146,18 +149,15 @@ impl HTMLTableRowElementMethods for HTMLTableRowElement {
 }
 
 pub trait HTMLTableRowElementLayoutHelpers {
-    fn get_background_color(&self) -> Option<RGBA>;
+    fn get_background_color(self) -> Option<RGBA>;
 }
 
-#[allow(unsafe_code)]
-impl HTMLTableRowElementLayoutHelpers for LayoutDom<HTMLTableRowElement> {
-    fn get_background_color(&self) -> Option<RGBA> {
-        unsafe {
-            (&*self.upcast::<Element>().unsafe_get())
-                .get_attr_for_layout(&ns!(), &local_name!("bgcolor"))
-                .and_then(AttrValue::as_color)
-                .cloned()
-        }
+impl HTMLTableRowElementLayoutHelpers for LayoutDom<'_, HTMLTableRowElement> {
+    fn get_background_color(self) -> Option<RGBA> {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("bgcolor"))
+            .and_then(AttrValue::as_color)
+            .cloned()
     }
 }
 

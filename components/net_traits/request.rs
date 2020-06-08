@@ -2,11 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use crate::response::HttpsState;
 use crate::ReferrerPolicy;
 use crate::ResourceTimingType;
 use content_security_policy::{self as csp, CspList};
 use http::HeaderMap;
 use hyper::Method;
+use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use mime::Mime;
 use msg::constellation_msg::PipelineId;
 use servo_url::{ImmutableOrigin, ServoUrl};
@@ -114,6 +116,84 @@ pub enum ParserMetadata {
     NotParserInserted,
 }
 
+/// <https://fetch.spec.whatwg.org/#concept-body-source>
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum BodySource {
+    Null,
+    Object,
+}
+
+/// Messages used to implement <https://fetch.spec.whatwg.org/#concept-request-transmit-body>
+#[derive(Debug, Deserialize, Serialize)]
+pub enum BodyChunkRequest {
+    /// Connect a fetch in `net`, with a stream of bytes from `script`.
+    Connect(IpcSender<Vec<u8>>),
+    /// Re-extract a new stream from the source, following a redirect.
+    Extract(IpcReceiver<BodyChunkRequest>),
+    /// Ask for another chunk.
+    Chunk,
+    /// Signal the stream is done.
+    Done,
+}
+
+/// The net component's view into <https://fetch.spec.whatwg.org/#bodies>
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct RequestBody {
+    /// Net's channel to communicate with script re this body.
+    #[ignore_malloc_size_of = "Channels are hard"]
+    chan: IpcSender<BodyChunkRequest>,
+    /// Has the stream been read from already?
+    read_from: bool,
+    /// <https://fetch.spec.whatwg.org/#concept-body-source>
+    source: BodySource,
+    /// <https://fetch.spec.whatwg.org/#concept-body-total-bytes>
+    total_bytes: Option<usize>,
+}
+
+impl RequestBody {
+    pub fn new(
+        chan: IpcSender<BodyChunkRequest>,
+        source: BodySource,
+        total_bytes: Option<usize>,
+    ) -> Self {
+        RequestBody {
+            chan,
+            source,
+            total_bytes,
+            read_from: false,
+        }
+    }
+
+    pub fn take_stream(&mut self) -> Option<IpcSender<BodyChunkRequest>> {
+        if self.read_from {
+            match self.source {
+                BodySource::Null => panic!(
+                    "Null sources should never be read more than once(no re-direct allowed)."
+                ),
+                BodySource::Object => {
+                    let (chan, port) = ipc::channel().unwrap();
+                    let _ = self.chan.send(BodyChunkRequest::Extract(port));
+                    self.chan = chan.clone();
+                    return Some(chan);
+                },
+            }
+        }
+        self.read_from = true;
+        Some(self.chan.clone())
+    }
+
+    pub fn source_is_null(&self) -> bool {
+        if let BodySource::Null = self.source {
+            return true;
+        }
+        false
+    }
+
+    pub fn len(&self) -> Option<usize> {
+        self.total_bytes.clone()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct RequestBuilder {
     #[serde(
@@ -130,7 +210,7 @@ pub struct RequestBuilder {
     #[ignore_malloc_size_of = "Defined in hyper"]
     pub headers: HeaderMap,
     pub unsafe_request: bool,
-    pub body: Option<Vec<u8>>,
+    pub body: Option<RequestBody>,
     pub service_workers_mode: ServiceWorkersMode,
     // TODO: client object
     pub destination: Destination,
@@ -156,6 +236,7 @@ pub struct RequestBuilder {
     pub url_list: Vec<ServoUrl>,
     pub parser_metadata: ParserMetadata,
     pub initiator: Initiator,
+    pub https_state: HttpsState,
 }
 
 impl RequestBuilder {
@@ -184,6 +265,7 @@ impl RequestBuilder {
             parser_metadata: ParserMetadata::Default,
             initiator: Initiator::None,
             csp_list: None,
+            https_state: HttpsState::None,
         }
     }
 
@@ -207,7 +289,7 @@ impl RequestBuilder {
         self
     }
 
-    pub fn body(mut self, body: Option<Vec<u8>>) -> RequestBuilder {
+    pub fn body(mut self, body: Option<RequestBody>) -> RequestBuilder {
         self.body = body;
         self
     }
@@ -277,11 +359,17 @@ impl RequestBuilder {
         self
     }
 
+    pub fn https_state(mut self, https_state: HttpsState) -> RequestBuilder {
+        self.https_state = https_state;
+        self
+    }
+
     pub fn build(self) -> Request {
         let mut request = Request::new(
             self.url.clone(),
             Some(Origin::Origin(self.origin)),
             self.pipeline_id,
+            self.https_state,
         );
         request.initiator = self.initiator;
         request.method = self.method;
@@ -329,7 +417,7 @@ pub struct Request {
     /// <https://fetch.spec.whatwg.org/#unsafe-request-flag>
     pub unsafe_request: bool,
     /// <https://fetch.spec.whatwg.org/#concept-request-body>
-    pub body: Option<Vec<u8>>,
+    pub body: Option<RequestBody>,
     // TODO: client object
     pub window: Window,
     // TODO: target browsing context
@@ -380,10 +468,16 @@ pub struct Request {
     // boundary every time a redirect occurs.
     #[ignore_malloc_size_of = "Defined in rust-content-security-policy"]
     pub csp_list: Option<CspList>,
+    pub https_state: HttpsState,
 }
 
 impl Request {
-    pub fn new(url: ServoUrl, origin: Option<Origin>, pipeline_id: Option<PipelineId>) -> Request {
+    pub fn new(
+        url: ServoUrl,
+        origin: Option<Origin>,
+        pipeline_id: Option<PipelineId>,
+        https_state: HttpsState,
+    ) -> Request {
         Request {
             method: Method::GET,
             local_urls_only: false,
@@ -413,6 +507,7 @@ impl Request {
             redirect_count: 0,
             response_tainting: ResponseTainting::Basic,
             csp_list: None,
+            https_state: https_state,
         }
     }
 

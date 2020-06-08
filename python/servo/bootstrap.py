@@ -21,33 +21,6 @@ import servo.packages as packages
 from servo.util import extract, download_file, host_triple
 
 
-def install_trusty_deps(force):
-    version = str(subprocess.check_output(['gcc', '-dumpversion'])).split('.')
-    gcc = True
-    if int(version[0]) > 4:
-        gcc = False
-    elif int(version[0]) == 4 and int(version[1]) >= 9:
-        gcc = False
-
-    version = str(subprocess.check_output(['clang', '-dumpversion'])).split('.')
-    clang = int(version[0]) < 4
-
-    if gcc:
-        run_as_root(["add-apt-repository", "ppa:ubuntu-toolchain-r/test"], force)
-        run_as_root(["apt-get", "update"])
-        run_as_root(["apt-get", "install", "gcc-4.9", "g++-4.9"], force)
-        run_as_root(['update-alternatives', '--install', '/usr/bin/gcc', 'gcc',
-                     '/usr/bin/gcc-4.9', '60', '--slave', '/usr/bin/g++', 'g++',
-                     '/usr/bin/g++-4.9'])
-    if clang:
-        run_as_root(["bash", "-c", 'wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -'])
-        run_as_root(["apt-add-repository", "deb http://apt.llvm.org/trusty/ llvm-toolchain-xenial-4.0 main"], force)
-        run_as_root(["apt-get", "update"])
-        run_as_root(["apt-get", "install", "clang-4.0"], force)
-
-    return gcc or clang
-
-
 def check_gstreamer_lib():
     return subprocess.call(["pkg-config", "--atleast-version=1.16", "gstreamer-1.0"],
                            stdout=PIPE, stderr=PIPE) == 0
@@ -57,14 +30,14 @@ def run_as_root(command, force=False):
     if os.geteuid() != 0:
         command.insert(0, 'sudo')
     if force:
-        command += "-y"
+        command.append('-y')
     return subprocess.call(command)
 
 
-def install_linux_deps(context, pkgs_ubuntu, pkgs_fedora, force):
+def install_linux_deps(context, pkgs_ubuntu, pkgs_fedora, pkgs_void, force):
     install = False
     pkgs = []
-    if context.distro == 'Ubuntu':
+    if context.distro in ['Ubuntu', 'Debian GNU/Linux']:
         command = ['apt-get', 'install']
         pkgs = pkgs_ubuntu
         if subprocess.call(['dpkg', '-s'] + pkgs, stdout=PIPE, stderr=PIPE) != 0:
@@ -77,20 +50,27 @@ def install_linux_deps(context, pkgs_ubuntu, pkgs_fedora, force):
             if "|{}".format(p) not in installed_pkgs:
                 install = True
                 break
+    elif context.distro == 'void':
+        installed_pkgs = str(subprocess.check_output(['xbps-query', '-l']))
+        pkgs = pkgs_void
+        for p in pkgs:
+            command = ['xbps-install', '-A']
+            if "ii {}-".format(p) not in installed_pkgs:
+                install = force = True
+                break
 
     if install:
-        if force:
-            command.append('-y')
         print("Installing missing dependencies...")
-        run_as_root(command + pkgs)
-        return True
-    return False
+        run_as_root(command + pkgs, force)
+
+    return install
 
 
 def install_salt_dependencies(context, force):
     pkgs_apt = ['build-essential', 'libssl-dev', 'libffi-dev', 'python-dev']
     pkgs_dnf = ['gcc', 'libffi-devel', 'python-devel', 'openssl-devel']
-    if not install_linux_deps(context, pkgs_apt, pkgs_dnf, force):
+    pkgs_xbps = ['gcc', 'libffi-devel', 'python-devel']
+    if not install_linux_deps(context, pkgs_apt, pkgs_dnf, pkgs_xbps, force):
         print("Dependencies are already installed")
 
 
@@ -113,32 +93,37 @@ def linux(context, force=False):
     # Please keep these in sync with the packages in README.md
     pkgs_apt = ['git', 'curl', 'autoconf', 'libx11-dev', 'libfreetype6-dev',
                 'libgl1-mesa-dri', 'libglib2.0-dev', 'xorg-dev', 'gperf', 'g++',
-                'build-essential', 'cmake', "libssl-dev", 'libbz2-dev',
-                'liblzma-dev', 'libosmesa6-dev', 'libxmu6', 'libxmu-dev',
-                'libglu1-mesa-dev', 'libgles2-mesa-dev', 'libegl1-mesa-dev',
-                'libdbus-1-dev', 'libharfbuzz-dev', 'ccache', 'clang',
-                'autoconf2.13', 'libunwind-dev', 'llvm-dev']
+                'build-essential', 'cmake', 'libssl-dev',
+                'liblzma-dev', 'libxmu6', 'libxmu-dev',
+                'libgles2-mesa-dev', 'libegl1-mesa-dev', 'libdbus-1-dev',
+                'libharfbuzz-dev', 'ccache', 'clang', 'libunwind-dev',
+                'libgstreamer1.0-dev', 'libgstreamer-plugins-base1.0-dev',
+                'libgstreamer-plugins-bad1.0-dev', 'autoconf2.13',
+                'libunwind-dev', 'llvm-dev']
     pkgs_dnf = ['libtool', 'gcc-c++', 'libXi-devel', 'freetype-devel',
                 'libunwind-devel', 'mesa-libGL-devel', 'mesa-libEGL-devel',
                 'glib2-devel', 'libX11-devel', 'libXrandr-devel', 'gperf',
                 'fontconfig-devel', 'cabextract', 'ttmkfdir', 'expat-devel',
-                'rpm-build', 'openssl-devel', 'cmake', 'bzip2-devel',
-                'libXcursor-devel', 'libXmu-devel', 'mesa-libOSMesa-devel',
+                'rpm-build', 'openssl-devel', 'cmake',
+                'libXcursor-devel', 'libXmu-devel',
                 'dbus-devel', 'ncurses-devel', 'harfbuzz-devel', 'ccache',
-                'mesa-libGLU-devel', 'clang', 'clang-libs', 'gstreamer1-devel',
-                'gstreamer1-plugins-base-devel',
-                'gstreamer1-plugins-bad-free-devel', 'autoconf213']
-    if context.distro == "Ubuntu" and context.distro_version != "14.04":
-        pkgs_apt += ['libgstreamer1.0-dev', 'libgstreamer-plugins-base1.0-dev',
-                     'libgstreamer-plugins-bad1.0-dev']
+                'clang', 'clang-libs', 'autoconf213', 'python3-devel',
+                'gstreamer1-devel', 'gstreamer1-plugins-base-devel',
+                'gstreamer1-plugins-bad-free-devel']
+    pkgs_xbps = ['libtool', 'gcc', 'libXi-devel', 'freetype-devel',
+                 'libunwind-devel', 'MesaLib-devel', 'glib-devel', 'pkg-config',
+                 'libX11-devel', 'libXrandr-devel', 'gperf', 'bzip2-devel',
+                 'fontconfig-devel', 'cabextract', 'expat-devel', 'cmake',
+                 'cmake', 'libXcursor-devel', 'libXmu-devel', 'dbus-devel',
+                 'ncurses-devel', 'harfbuzz-devel', 'ccache', 'glu-devel',
+                 'clang', 'gstreamer1-devel', 'autoconf213',
+                 'gst-plugins-base1-devel', 'gst-plugins-bad1-devel']
 
-    installed_something = install_linux_deps(context, pkgs_apt, pkgs_dnf, force)
+    installed_something = install_linux_deps(context, pkgs_apt, pkgs_dnf,
+                                             pkgs_xbps, force)
 
     if not check_gstreamer_lib():
         installed_something |= gstreamer(context, force)
-
-    if context.distro == "Ubuntu" and context.distro_version == "14.04":
-        installed_something |= install_trusty_deps(force)
 
     if not installed_something:
         print("Dependencies were already installed!")
@@ -150,7 +135,7 @@ def salt(context, force=False):
     # Ensure Salt dependencies are installed
     install_salt_dependencies(context, force)
     # Ensure Salt is installed in the virtualenv
-    # It's not instaled globally because it's a large, non-required dependency,
+    # It's not installed globally because it's a large, non-required dependency,
     # and the installation fails on Windows
     print("Checking Salt installation...", end='')
     reqs_path = os.path.join(context.topdir, 'python', 'requirements-salt.txt')
@@ -356,8 +341,6 @@ def get_linux_distribution():
             base_version = '18.04'
         elif major == '18':
             base_version = '16.04'
-        elif major == '17':
-            base_version = '14.04'
         else:
             raise Exception('unsupported version of %s: %s' % (distrib, version))
 
@@ -372,8 +355,6 @@ def get_linux_distribution():
             base_version = '18.04'
         elif major == '18':
             base_version = '16.04'
-        elif major == '17':
-            base_version = '14.04'
         else:
             raise Exception('unsupported version of %s: %s' % (distrib, version))
 
@@ -383,17 +364,11 @@ def get_linux_distribution():
             base_version = '18.04'
         elif version[0:3] == '0.4':
             base_version = '16.04'
-        elif version[0:3] == '0.3':
-            base_version = '14.04'
-        elif version == '0.2':
-            base_version = '12.04'
-        elif version == '0.1':
-            base_version = '10.10'
         else:
             raise Exception('unsupported version of %s: %s' % (distrib, version))
         distrib, version = 'Ubuntu', base_version
     elif distrib.lower() == 'ubuntu':
-        if version > '19.10':
+        if version > '20.04':
             raise Exception('unsupported version of %s: %s' % (distrib, version))
     # Fixme: we should allow checked/supported versions only
     elif distrib.lower() not in [
@@ -401,6 +376,7 @@ def get_linux_distribution():
         'centos linux',
         'debian gnu/linux',
         'fedora',
+        'void',
     ]:
         raise Exception('mach bootstrap does not support %s, please file a bug' % distrib)
 

@@ -2,24 +2,65 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use crate::cell::ArcRefCell;
+use crate::dom_traversal::{NodeAndStyleInfo, NodeExt, WhichPseudoElement};
 use crate::geom::flow_relative::{Rect, Sides};
 use crate::geom::{PhysicalPoint, PhysicalRect};
 #[cfg(debug_assertions)]
 use crate::layout_debug;
-use crate::positioned::HoistedFragmentId;
+use gfx::font::FontMetrics as GfxFontMetrics;
 use gfx::text::glyph::GlyphStore;
 use gfx_traits::print_tree::PrintTree;
+use gfx_traits::{combine_id_with_fragment_type, FragmentType};
 #[cfg(not(debug_assertions))]
 use serde::ser::{Serialize, Serializer};
 use servo_arc::Arc as ServoArc;
 use std::sync::Arc;
 use style::computed_values::overflow_x::T as ComputedOverflow;
+use style::computed_values::position::T as ComputedPosition;
 use style::dom::OpaqueNode;
 use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
 use style::values::computed::Length;
+use style::values::specified::text::TextDecorationLine;
 use style::Zero;
 use webrender_api::{FontInstanceKey, ImageKey};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) enum Tag {
+    Node(OpaqueNode),
+    BeforePseudo(OpaqueNode),
+    AfterPseudo(OpaqueNode),
+}
+
+impl Tag {
+    pub(crate) fn node(&self) -> OpaqueNode {
+        match self {
+            Self::Node(node) | Self::AfterPseudo(node) | Self::BeforePseudo(node) => *node,
+        }
+    }
+
+    pub(crate) fn to_display_list_fragment_id(&self) -> u64 {
+        let (node, content_type) = match self {
+            Self::Node(node) => (node, FragmentType::FragmentBody),
+            Self::AfterPseudo(node) => (node, FragmentType::BeforePseudoContent),
+            Self::BeforePseudo(node) => (node, FragmentType::AfterPseudoContent),
+        };
+        combine_id_with_fragment_type(node.id() as usize, content_type) as u64
+    }
+
+    pub(crate) fn from_node_and_style_info<'dom, Node>(info: &NodeAndStyleInfo<Node>) -> Self
+    where
+        Node: NodeExt<'dom>,
+    {
+        let opaque_node = info.node.as_opaque();
+        match info.pseudo_element_type {
+            None => Self::Node(opaque_node),
+            Some(WhichPseudoElement::Before) => Self::BeforePseudo(opaque_node),
+            Some(WhichPseudoElement::After) => Self::AfterPseudo(opaque_node),
+        }
+    }
+}
 
 #[derive(Serialize)]
 pub(crate) enum Fragment {
@@ -31,15 +72,18 @@ pub(crate) enum Fragment {
 }
 
 #[derive(Serialize)]
-pub(crate) struct AbsoluteOrFixedPositionedFragment(pub HoistedFragmentId);
+pub(crate) struct AbsoluteOrFixedPositionedFragment {
+    pub position: ComputedPosition,
+    pub hoisted_fragment: ArcRefCell<Option<ArcRefCell<Fragment>>>,
+}
 
 #[derive(Serialize)]
 pub(crate) struct BoxFragment {
-    pub tag: OpaqueNode,
+    pub tag: Tag,
     pub debug_id: DebugId,
     #[serde(skip_serializing)]
     pub style: ServoArc<ComputedValues>,
-    pub children: Vec<Fragment>,
+    pub children: Vec<ArcRefCell<Fragment>>,
 
     /// From the containing block’s start corner…?
     /// This might be broken when the containing block is in a different writing mode:
@@ -54,11 +98,6 @@ pub(crate) struct BoxFragment {
 
     /// The scrollable overflow of this box fragment.
     pub scrollable_overflow_from_children: PhysicalRect<Length>,
-
-    /// If this fragment was laid out from a hoisted box, this id corresponds to the id stored in
-    /// the AbsoluteOrFixedPositionedFragment left as a placeholder in the tree position of the
-    /// box.
-    pub hoisted_fragment_id: Option<HoistedFragmentId>,
 }
 
 #[derive(Serialize)]
@@ -79,24 +118,49 @@ pub(crate) struct CollapsedMargin {
 pub(crate) struct AnonymousFragment {
     pub debug_id: DebugId,
     pub rect: Rect<Length>,
-    pub children: Vec<Fragment>,
+    pub children: Vec<ArcRefCell<Fragment>>,
     pub mode: WritingMode,
 
     /// The scrollable overflow of this anonymous fragment's children.
     pub scrollable_overflow: PhysicalRect<Length>,
 }
 
+#[derive(Clone, Copy, Serialize)]
+pub(crate) struct FontMetrics {
+    pub ascent: Length,
+    pub line_gap: Length,
+    pub underline_offset: Length,
+    pub underline_size: Length,
+    pub strikeout_offset: Length,
+    pub strikeout_size: Length,
+}
+
+impl From<&GfxFontMetrics> for FontMetrics {
+    fn from(metrics: &GfxFontMetrics) -> FontMetrics {
+        FontMetrics {
+            ascent: metrics.ascent.into(),
+            line_gap: metrics.line_gap.into(),
+            underline_offset: metrics.underline_offset.into(),
+            underline_size: metrics.underline_size.into(),
+            strikeout_offset: metrics.strikeout_offset.into(),
+            strikeout_size: metrics.strikeout_size.into(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub(crate) struct TextFragment {
     pub debug_id: DebugId,
-    pub tag: OpaqueNode,
+    pub tag: Tag,
     #[serde(skip_serializing)]
     pub parent_style: ServoArc<ComputedValues>,
     pub rect: Rect<Length>,
-    pub ascent: Length,
+    pub font_metrics: FontMetrics,
     #[serde(skip_serializing)]
     pub font_key: FontInstanceKey,
     pub glyphs: Vec<Arc<GlyphStore>>,
+    /// A flag that represents the _used_ value of the text-decoration property.
+    pub text_decoration_line: TextDecorationLine,
 }
 
 #[derive(Serialize)]
@@ -122,6 +186,16 @@ impl Fragment {
         position.inline += *offset;
     }
 
+    pub fn tag(&self) -> Option<Tag> {
+        match self {
+            Fragment::Box(fragment) => Some(fragment.tag),
+            Fragment::Text(fragment) => Some(fragment.tag),
+            Fragment::AbsoluteOrFixedPositioned(_) |
+            Fragment::Anonymous(_) |
+            Fragment::Image(_) => None,
+        }
+    }
+
     pub fn print(&self, tree: &mut PrintTree) {
         match self {
             Fragment::Box(fragment) => fragment.print(tree),
@@ -132,10 +206,10 @@ impl Fragment {
         }
     }
 
-    pub fn scrollable_overflow(&self) -> PhysicalRect<Length> {
-        // FIXME(mrobinson, bug 25564): We should be using the containing block
-        // here to properly convert scrollable overflow to physical geometry.
-        let containing_block = PhysicalRect::zero();
+    pub fn scrollable_overflow(
+        &self,
+        containing_block: &PhysicalRect<Length>,
+    ) -> PhysicalRect<Length> {
         match self {
             Fragment::Box(fragment) => fragment.scrollable_overflow_for_parent(&containing_block),
             Fragment::AbsoluteOrFixedPositioned(_) => PhysicalRect::zero(),
@@ -149,16 +223,36 @@ impl Fragment {
         }
     }
 
-    pub fn is_hoisted(&self) -> bool {
-        match self {
-            Fragment::Box(fragment) if fragment.hoisted_fragment_id.is_some() => true,
-            _ => false,
+    pub(crate) fn find<T>(
+        &self,
+        containing_block: &PhysicalRect<Length>,
+        process_func: &mut impl FnMut(&Fragment, &PhysicalRect<Length>) -> Option<T>,
+    ) -> Option<T> {
+        if let Some(result) = process_func(self, containing_block) {
+            return Some(result);
         }
-    }
 
-    pub fn hoisted_fragment_id(&self) -> Option<&HoistedFragmentId> {
         match self {
-            Fragment::Box(fragment) => fragment.hoisted_fragment_id.as_ref(),
+            Fragment::Box(fragment) => {
+                let new_containing_block = fragment
+                    .content_rect
+                    .to_physical(fragment.style.writing_mode, containing_block)
+                    .translate(containing_block.origin.to_vector());
+                fragment
+                    .children
+                    .iter()
+                    .find_map(|child| child.borrow().find(&new_containing_block, process_func))
+            },
+            Fragment::Anonymous(fragment) => {
+                let new_containing_block = fragment
+                    .rect
+                    .to_physical(fragment.mode, containing_block)
+                    .translate(containing_block.origin.to_vector());
+                fragment
+                    .children
+                    .iter()
+                    .find_map(|child| child.borrow().find(&new_containing_block, process_func))
+            },
             _ => None,
         }
     }
@@ -166,7 +260,7 @@ impl Fragment {
 
 impl AbsoluteOrFixedPositionedFragment {
     pub fn print(&self, tree: &mut PrintTree) {
-        tree.add_item(format!("AbsoluteOrFixedPositionedFragment({:?})", self.0));
+        tree.add_item(format!("AbsoluteOrFixedPositionedFragment"));
     }
 }
 
@@ -182,18 +276,24 @@ impl AnonymousFragment {
     }
 
     pub fn new(rect: Rect<Length>, children: Vec<Fragment>, mode: WritingMode) -> Self {
+        // FIXME(mrobinson, bug 25564): We should be using the containing block
+        // here to properly convert scrollable overflow to physical geometry.
+        let containing_block = PhysicalRect::zero();
         let content_origin = rect.start_corner.to_physical(mode);
         let scrollable_overflow = children.iter().fold(PhysicalRect::zero(), |acc, child| {
             acc.union(
                 &child
-                    .scrollable_overflow()
+                    .scrollable_overflow(&containing_block)
                     .translate(content_origin.to_vector()),
             )
         });
         AnonymousFragment {
             debug_id: DebugId::new(),
             rect,
-            children,
+            children: children
+                .into_iter()
+                .map(|fragment| ArcRefCell::new(fragment))
+                .collect(),
             mode,
             scrollable_overflow,
         }
@@ -208,7 +308,7 @@ impl AnonymousFragment {
         ));
 
         for child in &self.children {
-            child.print(tree);
+            child.borrow().print(tree);
         }
         tree.end_level();
     }
@@ -216,7 +316,7 @@ impl AnonymousFragment {
 
 impl BoxFragment {
     pub fn new(
-        tag: OpaqueNode,
+        tag: Tag,
         style: ServoArc<ComputedValues>,
         children: Vec<Fragment>,
         content_rect: Rect<Length>,
@@ -224,33 +324,38 @@ impl BoxFragment {
         border: Sides<Length>,
         margin: Sides<Length>,
         block_margins_collapsed_with_children: CollapsedBlockMargins,
-        hoisted_fragment_id: Option<HoistedFragmentId>,
     ) -> BoxFragment {
+        // FIXME(mrobinson, bug 25564): We should be using the containing block
+        // here to properly convert scrollable overflow to physical geometry.
+        let containing_block = PhysicalRect::zero();
         let scrollable_overflow_from_children =
             children.iter().fold(PhysicalRect::zero(), |acc, child| {
-                acc.union(&child.scrollable_overflow())
+                acc.union(&child.scrollable_overflow(&containing_block))
             });
         BoxFragment {
             tag,
             debug_id: DebugId::new(),
             style,
-            children,
+            children: children
+                .into_iter()
+                .map(|fragment| ArcRefCell::new(fragment))
+                .collect(),
             content_rect,
             padding,
             border,
             margin,
             block_margins_collapsed_with_children,
             scrollable_overflow_from_children,
-            hoisted_fragment_id,
         }
     }
 
-    pub fn scrollable_overflow(&self) -> PhysicalRect<Length> {
-        // FIXME(mrobinson, bug 25564): We should be using the containing block
-        // here to properly convert scrollable overflow to physical geometry.
+    pub fn scrollable_overflow(
+        &self,
+        containing_block: &PhysicalRect<Length>,
+    ) -> PhysicalRect<Length> {
         let physical_padding_rect = self
             .padding_rect()
-            .to_physical(self.style.writing_mode, &PhysicalRect::zero());
+            .to_physical(self.style.writing_mode, containing_block);
 
         let content_origin = self
             .content_rect
@@ -279,20 +384,18 @@ impl BoxFragment {
                 \nborder rect={:?}\
                 \nscrollable_overflow={:?}\
                 \noverflow={:?} / {:?}\
-                \nstyle={:p}\
-                \nhoisted_id={:?}",
+                \nstyle={:p}",
             self.content_rect,
             self.padding_rect(),
             self.border_rect(),
-            self.scrollable_overflow(),
+            self.scrollable_overflow(&PhysicalRect::zero()),
             self.style.get_box().overflow_x,
             self.style.get_box().overflow_y,
             self.style,
-            self.hoisted_fragment_id,
         ));
 
         for child in &self.children {
-            child.print(tree);
+            child.borrow().print(tree);
         }
         tree.end_level();
     }
@@ -313,7 +416,7 @@ impl BoxFragment {
 
         // https://www.w3.org/TR/css-overflow-3/#scrollable
         // Only include the scrollable overflow of a child box if it has overflow: visible.
-        let scrollable_overflow = self.scrollable_overflow();
+        let scrollable_overflow = self.scrollable_overflow(&containing_block);
         let bottom_right = PhysicalPoint::new(
             overflow.max_x().max(scrollable_overflow.max_x()),
             overflow.max_y().max(scrollable_overflow.max_y()),

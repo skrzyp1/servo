@@ -8,10 +8,12 @@ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::xrinputsource::XRInputSource;
+use crate::dom::xrjointspace::XRJointSpace;
 use crate::dom::xrreferencespace::XRReferenceSpace;
 use crate::dom::xrsession::{cast_transform, ApiPose, XRSession};
 use dom_struct::dom_struct;
-use webxr_api::Frame;
+use euclid::RigidTransform3D;
+use webxr_api::{BaseSpace, Frame, Space};
 
 #[dom_struct]
 pub struct XRSpace {
@@ -56,6 +58,26 @@ impl XRSpace {
             global,
         )
     }
+
+    pub fn space(&self) -> Space {
+        if let Some(rs) = self.downcast::<XRReferenceSpace>() {
+            rs.space()
+        } else if let Some(j) = self.downcast::<XRJointSpace>() {
+            j.space()
+        } else if let Some(source) = self.input_source.get() {
+            let base = if self.is_grip_space {
+                BaseSpace::Grip(source.id())
+            } else {
+                BaseSpace::TargetRay(source.id())
+            };
+            Space {
+                base,
+                offset: RigidTransform3D::identity(),
+            }
+        } else {
+            panic!("invalid space found")
+        }
+    }
 }
 
 impl XRSpace {
@@ -67,6 +89,8 @@ impl XRSpace {
     pub fn get_pose(&self, base_pose: &Frame) -> Option<ApiPose> {
         if let Some(reference) = self.downcast::<XRReferenceSpace>() {
             reference.get_pose(base_pose)
+        } else if let Some(joint) = self.downcast::<XRJointSpace>() {
+            joint.get_pose(base_pose)
         } else if let Some(source) = self.input_source.get() {
             // XXXManishearth we should be able to request frame information
             // for inputs when necessary instead of always loading it

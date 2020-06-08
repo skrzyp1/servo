@@ -14,7 +14,9 @@ use crate::display_list::background::{self, get_cyclic};
 use crate::display_list::border;
 use crate::display_list::gradient;
 use crate::display_list::items::{self, BaseDisplayItem, ClipScrollNode};
-use crate::display_list::items::{ClipScrollNodeIndex, ClipScrollNodeType, ClippingAndScrolling};
+use crate::display_list::items::{
+    ClipScrollNodeIndex, ClipScrollNodeType, ClipType, ClippingAndScrolling,
+};
 use crate::display_list::items::{ClippingRegion, DisplayItem, DisplayItemMetadata, DisplayList};
 use crate::display_list::items::{CommonDisplayItem, DisplayListSection};
 use crate::display_list::items::{IframeDisplayItem, OpaqueNode};
@@ -60,17 +62,17 @@ use style::logical_geometry::{LogicalMargin, LogicalPoint, LogicalRect};
 use style::properties::{style_structs, ComputedValues};
 use style::servo::restyle_damage::ServoRestyleDamage;
 use style::values::computed::effects::SimpleShadow;
-use style::values::computed::image::{Image, ImageLayer};
+use style::values::computed::image::Image;
 use style::values::computed::{ClipRectOrAuto, Gradient, LengthOrAuto};
 use style::values::generics::background::BackgroundSize;
-use style::values::generics::image::{GradientKind, PaintWorklet};
+use style::values::generics::image::PaintWorklet;
 use style::values::specified::ui::CursorKind;
 use style::values::RGBA;
 use style_traits::ToCss;
 use webrender_api::units::{LayoutRect, LayoutTransform, LayoutVector2D};
 use webrender_api::{self, BorderDetails, BorderRadius, BorderSide, BoxShadowClipMode, ColorF};
 use webrender_api::{ColorU, ExternalScrollId, FilterOp, GlyphInstance, ImageRendering, LineStyle};
-use webrender_api::{NinePatchBorder, NinePatchBorderSource, NormalBorder};
+use webrender_api::{NinePatchBorder, NinePatchBorderSource, NormalBorder, PropertyBinding};
 use webrender_api::{ScrollSensitivity, StickyOffsetBounds};
 
 static THREAD_TINT_COLORS: [ColorF; 8] = [
@@ -424,15 +426,8 @@ impl<'a> DisplayListBuildState<'a> {
     }
 
     fn add_late_clip_node(&mut self, rect: LayoutRect, radii: BorderRadius) -> ClipScrollNodeIndex {
-        let mut clip = ClippingRegion::from_rect(rect);
-        clip.intersect_with_rounded_rect(rect, radii);
-
-        let node = ClipScrollNode {
-            parent_index: self.current_clipping_and_scrolling.scrolling,
-            clip,
-            content_rect: LayoutRect::zero(), // content_rect isn't important for clips.
-            node_type: ClipScrollNodeType::Clip,
-        };
+        let node =
+            ClipScrollNode::rounded(rect, radii, self.current_clipping_and_scrolling.scrolling);
 
         // We want the scroll root to be defined before any possible item that could use it,
         // so we make sure that it is added to the beginning of the parent "real" (non-pseudo)
@@ -721,8 +716,9 @@ impl Fragment {
             state.add_display_item(DisplayItem::Rectangle(CommonDisplayItem::new(
                 base,
                 webrender_api::RectangleDisplayItem {
-                    color: background_color.to_layout(),
+                    color: PropertyBinding::Value(background_color.to_layout()),
                     common: items::empty_common_item_properties(),
+                    bounds: bounds.to_layout(),
                 },
             )));
         });
@@ -732,12 +728,8 @@ impl Fragment {
         // http://www.w3.org/TR/CSS21/colors.html#background
         let background = style.get_background();
         for (i, background_image) in background.background_image.0.iter().enumerate().rev() {
-            let background_image = match *background_image {
-                ImageLayer::None => continue,
-                ImageLayer::Image(ref image) => image,
-            };
-
             match *background_image {
+                Image::None => {},
                 Image::Gradient(ref gradient) => {
                     self.build_display_list_for_background_gradient(
                         state,
@@ -975,15 +967,15 @@ impl Fragment {
                 display_list_section,
             );
 
-            let display_item = match gradient.kind {
-                GradientKind::Linear(angle_or_corner) => {
-                    let (gradient, stops) = gradient::linear(
-                        style,
-                        placement.tile_size,
-                        &gradient.items[..],
-                        angle_or_corner,
-                        gradient.repeating,
-                    );
+            let display_item = match gradient {
+                Gradient::Linear {
+                    ref direction,
+                    ref items,
+                    ref repeating,
+                    compat_mode: _,
+                } => {
+                    let (gradient, stops) =
+                        gradient::linear(style, placement.tile_size, items, *direction, *repeating);
                     let item = webrender_api::GradientDisplayItem {
                         gradient,
                         bounds: placement.bounds.to_f32_px(),
@@ -993,14 +985,20 @@ impl Fragment {
                     };
                     DisplayItem::Gradient(CommonDisplayItem::with_data(base, item, stops))
                 },
-                GradientKind::Radial(ref shape, ref center) => {
+                Gradient::Radial {
+                    ref shape,
+                    ref position,
+                    ref items,
+                    ref repeating,
+                    compat_mode: _,
+                } => {
                     let (gradient, stops) = gradient::radial(
                         style,
                         placement.tile_size,
-                        &gradient.items[..],
+                        items,
                         shape,
-                        center,
-                        gradient.repeating,
+                        position,
+                        *repeating,
                     );
                     let item = webrender_api::RadialGradientDisplayItem {
                         gradient,
@@ -1011,6 +1009,7 @@ impl Fragment {
                     };
                     DisplayItem::RadialGradient(CommonDisplayItem::with_data(base, item, stops))
                 },
+                Gradient::Conic { .. } => unimplemented!(),
             };
             state.add_display_item(display_item);
         });
@@ -1122,22 +1121,20 @@ impl Fragment {
         let border_radius = border::radii(bounds, border_style_struct);
         let border_widths = border.to_physical(style.writing_mode);
 
-        if let ImageLayer::Image(ref image) = border_style_struct.border_image_source {
-            if self
-                .build_display_list_for_border_image(
-                    state,
-                    style,
-                    base.clone(),
-                    bounds,
-                    image,
-                    border_widths,
-                )
-                .is_some()
-            {
-                return;
-            }
-            // Fallback to rendering a solid border.
+        if self
+            .build_display_list_for_border_image(
+                state,
+                style,
+                base.clone(),
+                bounds,
+                &border_style_struct.border_image_source,
+                border_widths,
+            )
+            .is_some()
+        {
+            return;
         }
+
         if border_widths == SideOffsets2D::zero() {
             return;
         }
@@ -1224,30 +1221,37 @@ impl Fragment {
                 height = image.height;
                 NinePatchBorderSource::Image(image.key?)
             },
-            Image::Gradient(ref gradient) => match gradient.kind {
-                GradientKind::Linear(angle_or_corner) => {
-                    let (wr_gradient, linear_stops) = gradient::linear(
-                        style,
-                        border_image_area,
-                        &gradient.items[..],
-                        angle_or_corner,
-                        gradient.repeating,
-                    );
+            Image::Gradient(ref gradient) => match **gradient {
+                Gradient::Linear {
+                    ref direction,
+                    ref items,
+                    ref repeating,
+                    compat_mode: _,
+                } => {
+                    let (wr_gradient, linear_stops) =
+                        gradient::linear(style, border_image_area, items, *direction, *repeating);
                     stops = linear_stops;
                     NinePatchBorderSource::Gradient(wr_gradient)
                 },
-                GradientKind::Radial(ref shape, ref center) => {
+                Gradient::Radial {
+                    ref shape,
+                    ref position,
+                    ref items,
+                    ref repeating,
+                    compat_mode: _,
+                } => {
                     let (wr_gradient, radial_stops) = gradient::radial(
                         style,
                         border_image_area,
-                        &gradient.items[..],
+                        items,
                         shape,
-                        center,
-                        gradient.repeating,
+                        position,
+                        *repeating,
                     );
                     stops = radial_stops;
                     NinePatchBorderSource::RadialGradient(wr_gradient)
                 },
+                Gradient::Conic { .. } => unimplemented!(),
             },
             _ => return None,
         };
@@ -1460,7 +1464,8 @@ impl Fragment {
                 base,
                 webrender_api::RectangleDisplayItem {
                     common: items::empty_common_item_properties(),
-                    color: background_color.to_layout(),
+                    color: PropertyBinding::Value(background_color.to_layout()),
+                    bounds: stacking_relative_border_box.to_layout(),
                 },
             )));
         }
@@ -1506,7 +1511,8 @@ impl Fragment {
             base,
             webrender_api::RectangleDisplayItem {
                 common: items::empty_common_item_properties(),
-                color: self.style().get_inherited_text().color.to_layout(),
+                color: PropertyBinding::Value(self.style().get_inherited_text().color.to_layout()),
+                bounds: insertion_point_bounds.to_layout(),
             },
         )));
     }
@@ -1689,7 +1695,8 @@ impl Fragment {
                 base,
                 webrender_api::RectangleDisplayItem {
                     common: items::empty_common_item_properties(),
-                    color: ColorF::TRANSPARENT,
+                    color: PropertyBinding::Value(ColorF::TRANSPARENT),
+                    bounds: content_size.to_layout(),
                 },
             )));
         }
@@ -1725,8 +1732,18 @@ impl Fragment {
                 build_border_radius_for_inner_rect(stacking_relative_border_box, &self.style);
 
             if !radii.is_zero() {
-                let clip_id =
-                    state.add_late_clip_node(stacking_relative_border_box.to_layout(), radii);
+                // This is already calculated inside of build_border_radius_for_inner_rect(), it would be
+                // nice if it were only calculated once.
+                let border_widths = self
+                    .style
+                    .logical_border_width()
+                    .to_physical(self.style.writing_mode);
+                let clip_id = state.add_late_clip_node(
+                    stacking_relative_border_box
+                        .inner_rect(border_widths)
+                        .to_layout(),
+                    radii,
+                );
                 state.current_clipping_and_scrolling = ClippingAndScrolling::simple(clip_id);
             }
 
@@ -1875,6 +1892,12 @@ impl Fragment {
                 }
             },
             SpecificFragmentInfo::Canvas(ref canvas_fragment_info) => {
+                if canvas_fragment_info.dom_width == Au(0) ||
+                    canvas_fragment_info.dom_height == Au(0)
+                {
+                    return;
+                }
+
                 let image_key = match canvas_fragment_info.source {
                     CanvasFragmentSource::WebGL(image_key) => image_key,
                     CanvasFragmentSource::Image(ref ipc_renderer) => match *ipc_renderer {
@@ -2615,10 +2638,18 @@ impl BlockFlow {
             .to_physical(self.fragment.style.writing_mode);
         let clip_rect = border_box.inner_rect(border_widths);
 
-        let mut clip = ClippingRegion::from_rect(clip_rect.to_layout());
+        let clip = ClippingRegion::from_rect(clip_rect.to_layout());
         let radii = build_border_radius_for_inner_rect(border_box, &self.fragment.style);
         if !radii.is_zero() {
-            clip.intersect_with_rounded_rect(clip_rect.to_layout(), radii)
+            let node = ClipScrollNode::rounded(
+                clip_rect.to_layout(),
+                radii,
+                state.current_clipping_and_scrolling.scrolling,
+            );
+            let clip_id = state.add_clip_scroll_node(node);
+            let new_clipping_and_scrolling = ClippingAndScrolling::simple(clip_id);
+            self.base.clipping_and_scrolling = Some(new_clipping_and_scrolling);
+            state.current_clipping_and_scrolling = new_clipping_and_scrolling;
         }
 
         let content_size = self.base.overflow.scroll.origin + self.base.overflow.scroll.size;
@@ -2685,7 +2716,7 @@ impl BlockFlow {
             parent_index: self.clipping_and_scrolling().scrolling,
             clip: ClippingRegion::from_rect(clip_rect.to_layout()),
             content_rect: LayoutRect::zero(), // content_rect isn't important for clips.
-            node_type: ClipScrollNodeType::Clip,
+            node_type: ClipScrollNodeType::Clip(ClipType::Rect),
         });
 
         let new_indices = ClippingAndScrolling::new(new_index, new_index);

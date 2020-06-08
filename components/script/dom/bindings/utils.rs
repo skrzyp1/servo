@@ -7,7 +7,9 @@
 use crate::dom::bindings::codegen::InterfaceObjectMap;
 use crate::dom::bindings::codegen::PrototypeList;
 use crate::dom::bindings::codegen::PrototypeList::{MAX_PROTO_CHAIN_LENGTH, PROTO_OR_IFACE_LENGTH};
-use crate::dom::bindings::conversions::{jsstring_to_str, private_from_proto_check};
+use crate::dom::bindings::conversions::{
+    jsstring_to_str, private_from_proto_check, PrototypeCheck,
+};
 use crate::dom::bindings::error::throw_invalid_this;
 use crate::dom::bindings::inheritance::TopTypeId;
 use crate::dom::bindings::str::DOMString;
@@ -44,6 +46,7 @@ use js::rust::wrappers::JS_HasPropertyById;
 use js::rust::wrappers::JS_SetProperty;
 use js::rust::{get_object_class, is_dom_class, GCMethods, ToString, ToWindowProxyIfWindow};
 use js::rust::{Handle, HandleId, HandleObject, HandleValue, MutableHandleValue};
+use js::typedarray::{CreateWith, Float32Array};
 use js::JS_CALLEE;
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use std::ffi::CString;
@@ -132,6 +135,15 @@ pub fn to_frozen_array<T: ToJSValConvertible>(convertibles: &[T], cx: SafeJSCont
     rooted!(in(*cx) let obj = ports.to_object());
     unsafe { JS_FreezeObject(*cx, RawHandleObject::from(obj.handle())) };
     *ports
+}
+
+/// Creates a Float32 array
+pub fn create_typed_array(cx: SafeJSContext, src: &[f32], dst: &Heap<*mut JSObject>) {
+    rooted!(in (*cx) let mut array = ptr::null_mut::<JSObject>());
+    unsafe {
+        let _ = Float32Array::create(*cx, CreateWith::Slice(src), array.handle_mut());
+    }
+    (*dst).set(array.get());
 }
 
 /// Returns the ProtoOrIfaceArray for the given global object.
@@ -497,9 +509,8 @@ unsafe fn generic_call(
     } else {
         GetNonCCWObjectGlobal(JS_CALLEE(cx, vp).to_object_or_null())
     });
-    let depth = (*info).__bindgen_anon_3.depth;
-    let proto_check =
-        |class: &'static DOMClass| class.interface_chain[depth as usize] as u16 == proto_id;
+    let depth = (*info).__bindgen_anon_3.depth as usize;
+    let proto_check = PrototypeCheck::Depth { depth, proto_id };
     let this = match private_from_proto_check(obj.get(), cx, proto_check) {
         Ok(val) => val,
         Err(()) => {

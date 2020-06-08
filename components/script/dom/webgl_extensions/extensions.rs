@@ -18,7 +18,7 @@ use crate::dom::oestexturehalffloat::OESTextureHalfFloat;
 use crate::dom::webglcolorbufferfloat::WEBGLColorBufferFloat;
 use crate::dom::webglrenderingcontext::WebGLRenderingContext;
 use crate::dom::webgltexture::TexCompression;
-use canvas_traits::webgl::{GlType, WebGLVersion};
+use canvas_traits::webgl::{GlType, TexFormat, WebGLSLVersion, WebGLVersion};
 use fnv::{FnvHashMap, FnvHashSet};
 use js::jsapi::JSObject;
 use malloc_size_of::MallocSizeOf;
@@ -52,10 +52,22 @@ const DEFAULT_DISABLED_GET_PARAMETER_NAMES_WEBGL1: [GLenum; 3] = [
     OESVertexArrayObjectConstants::VERTEX_ARRAY_BINDING_OES,
 ];
 
+// Param names that are implemented for glGetParameter in a WebGL 2.0 context
+// but must trigger a InvalidEnum error until the related WebGL Extensions are enabled.
+// Example: https://www.khronos.org/registry/webgl/extensions/EXT_texture_filter_anisotropic/
+const DEFAULT_DISABLED_GET_PARAMETER_NAMES_WEBGL2: [GLenum; 1] =
+    [EXTTextureFilterAnisotropicConstants::MAX_TEXTURE_MAX_ANISOTROPY_EXT];
+
 // Param names that are implemented for glGetTexParameter in a WebGL 1.0 context
 // but must trigger a InvalidEnum error until the related WebGL Extensions are enabled.
 // Example: https://www.khronos.org/registry/webgl/extensions/OES_standard_derivatives/
 const DEFAULT_DISABLED_GET_TEX_PARAMETER_NAMES_WEBGL1: [GLenum; 1] =
+    [EXTTextureFilterAnisotropicConstants::TEXTURE_MAX_ANISOTROPY_EXT];
+
+// Param names that are implemented for glGetTexParameter in a WebGL 2.0 context
+// but must trigger a InvalidEnum error until the related WebGL Extensions are enabled.
+// Example: https://www.khronos.org/registry/webgl/extensions/EXT_texture_filter_anisotropic/
+const DEFAULT_DISABLED_GET_TEX_PARAMETER_NAMES_WEBGL2: [GLenum; 1] =
     [EXTTextureFilterAnisotropicConstants::TEXTURE_MAX_ANISOTROPY_EXT];
 
 // Param names that are implemented for glGetVertexAttrib in a WebGL 1.0 context
@@ -70,7 +82,7 @@ struct WebGLExtensionFeatures {
     gl_extensions: FnvHashSet<String>,
     disabled_tex_types: FnvHashSet<GLenum>,
     not_filterable_tex_types: FnvHashSet<GLenum>,
-    effective_tex_internal_formats: FnvHashMap<TexFormatType, u32>,
+    effective_tex_internal_formats: FnvHashMap<TexFormatType, TexFormat>,
     /// WebGL Hint() targets enabled by extensions.
     hint_targets: FnvHashSet<GLenum>,
     /// WebGL GetParameter() names enabled by extensions.
@@ -94,6 +106,7 @@ impl WebGLExtensionFeatures {
             disabled_get_parameter_names,
             disabled_get_tex_parameter_names,
             disabled_get_vertex_attrib_names,
+            not_filterable_tex_types,
             element_index_uint_enabled,
             blend_minmax_enabled,
         ) = match webgl_version {
@@ -111,12 +124,20 @@ impl WebGLExtensionFeatures {
                     .iter()
                     .cloned()
                     .collect(),
+                DEFAULT_NOT_FILTERABLE_TEX_TYPES.iter().cloned().collect(),
                 false,
                 false,
             ),
             WebGLVersion::WebGL2 => (
                 Default::default(),
-                Default::default(),
+                DEFAULT_DISABLED_GET_PARAMETER_NAMES_WEBGL2
+                    .iter()
+                    .cloned()
+                    .collect(),
+                DEFAULT_DISABLED_GET_TEX_PARAMETER_NAMES_WEBGL2
+                    .iter()
+                    .cloned()
+                    .collect(),
                 Default::default(),
                 Default::default(),
                 true,
@@ -126,7 +147,7 @@ impl WebGLExtensionFeatures {
         Self {
             gl_extensions: Default::default(),
             disabled_tex_types,
-            not_filterable_tex_types: DEFAULT_NOT_FILTERABLE_TEX_TYPES.iter().cloned().collect(),
+            not_filterable_tex_types,
             effective_tex_internal_formats: Default::default(),
             hint_targets: Default::default(),
             disabled_get_parameter_names,
@@ -147,15 +168,21 @@ pub struct WebGLExtensions {
     features: DomRefCell<WebGLExtensionFeatures>,
     webgl_version: WebGLVersion,
     api_type: GlType,
+    glsl_version: WebGLSLVersion,
 }
 
 impl WebGLExtensions {
-    pub fn new(webgl_version: WebGLVersion, api_type: GlType) -> WebGLExtensions {
+    pub fn new(
+        webgl_version: WebGLVersion,
+        api_type: GlType,
+        glsl_version: WebGLSLVersion,
+    ) -> WebGLExtensions {
         Self {
             extensions: DomRefCell::new(HashMap::new()),
             features: DomRefCell::new(WebGLExtensionFeatures::new(webgl_version)),
             webgl_version,
             api_type,
+            glsl_version,
         }
     }
 
@@ -178,7 +205,7 @@ impl WebGLExtensions {
             .insert(name, Box::new(TypedWebGLExtensionWrapper::<T>::new()));
     }
 
-    pub fn get_suported_extensions(&self) -> Vec<&'static str> {
+    pub fn get_supported_extensions(&self) -> Vec<&'static str> {
         self.extensions
             .borrow()
             .iter()
@@ -255,9 +282,9 @@ impl WebGLExtensions {
 
     pub fn add_effective_tex_internal_format(
         &self,
-        source_internal_format: u32,
+        source_internal_format: TexFormat,
         source_data_type: u32,
-        effective_internal_format: u32,
+        effective_internal_format: TexFormat,
     ) {
         let format = TexFormatType(source_internal_format, source_data_type);
         self.features
@@ -268,9 +295,9 @@ impl WebGLExtensions {
 
     pub fn get_effective_tex_internal_format(
         &self,
-        source_internal_format: u32,
+        source_internal_format: TexFormat,
         source_data_type: u32,
-    ) -> u32 {
+    ) -> TexFormat {
         let format = TexFormatType(source_internal_format, source_data_type);
         *(self
             .features
@@ -381,6 +408,7 @@ impl WebGLExtensions {
         self.register::<ext::angleinstancedarrays::ANGLEInstancedArrays>();
         self.register::<ext::extblendminmax::EXTBlendMinmax>();
         self.register::<ext::extcolorbufferhalffloat::EXTColorBufferHalfFloat>();
+        self.register::<ext::extfragdepth::EXTFragDepth>();
         self.register::<ext::extshadertexturelod::EXTShaderTextureLod>();
         self.register::<ext::exttexturefilteranisotropic::EXTTextureFilterAnisotropic>();
         self.register::<ext::oeselementindexuint::OESElementIndexUint>();
@@ -415,6 +443,10 @@ impl WebGLExtensions {
         self.is_enabled::<WEBGLColorBufferFloat>() || self.is_enabled::<OESTextureFloat>()
     }
 
+    pub fn is_min_glsl_version_satisfied(&self, min_glsl_version: WebGLSLVersion) -> bool {
+        self.glsl_version >= min_glsl_version
+    }
+
     pub fn is_half_float_buffer_renderable(&self) -> bool {
         self.is_enabled::<EXTColorBufferHalfFloat>() || self.is_enabled::<OESTextureHalfFloat>()
     }
@@ -435,4 +467,4 @@ impl WebGLExtensions {
 
 // Helper structs
 #[derive(Eq, Hash, JSTraceable, MallocSizeOf, PartialEq)]
-struct TexFormatType(u32, u32);
+struct TexFormatType(TexFormat, u32);

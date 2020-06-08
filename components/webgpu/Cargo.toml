@@ -11,11 +11,12 @@ name = "webgpu"
 path = "lib.rs"
 
 [dependencies]
-embedder_traits = {path = "../embedder_traits"}
+arrayvec = { version = "0.5.1", features = ["serde"] }
 ipc-channel = "0.14"
 log = "0.4"
 malloc_size_of = { path = "../malloc_size_of" }
-serde = "1.0"
-servo_config = {path = "../config"}
-smallvec = "0.6"
-wgpu-core = { version = "0.1.0", git = "https://github.com/gfx-rs/wgpu", features = ["serde"] }
+serde = { version = "1.0", features = ["serde_derive"] }
+servo_config = { path = "../config" }
+smallvec = { version = "0.6", features = ["serde"] }
+wgpu-core = { version = "0.5.0", git = "https://github.com/gfx-rs/wgpu", features = ["replay", "trace"] }
+wgpu-types = { version = "0.5.0", git = "https://github.com/gfx-rs/wgpu", features = ["replay", "trace"] }

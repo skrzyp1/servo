@@ -2,6 +2,7 @@ DOMContentLoaded
 abort
 activate
 addtrack
+animationcancel
 animationend
 animationiteration
 animationstart
@@ -129,7 +130,10 @@ time
 timeupdate
 toggle
 track
+transitioncancel
 transitionend
+transitionrun
+transitionstart
 unhandledrejection
 unload
 url
@@ -141,5 +145,6 @@ webkitAnimationEnd
 webkitAnimationIteration
 webkitAnimationStart
 webkitTransitionEnd
+webkitTransitionRun
 week
 width

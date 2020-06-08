@@ -3,8 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #![deny(unsafe_code)]
-#![feature(arbitrary_self_types)]
-#![feature(exact_size_is_empty)]
 
 #[macro_use]
 extern crate log;
@@ -16,7 +14,8 @@ pub mod context;
 pub mod data;
 pub mod display_list;
 mod dom_traversal;
-mod element_data;
+pub mod element_data;
+mod flexbox;
 mod flow;
 mod formatting_contexts;
 mod fragments;
@@ -32,7 +31,7 @@ mod style_ext;
 pub mod traversal;
 pub mod wrapper;
 
-pub use flow::{BoxTreeRoot, FragmentTreeRoot};
+pub use flow::{BoxTree, FragmentTree};
 
 use crate::geom::flow_relative::Vec2;
 use style::properties::ComputedValues;

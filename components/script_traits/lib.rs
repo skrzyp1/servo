@@ -10,6 +10,8 @@
 #![deny(unsafe_code)]
 
 #[macro_use]
+extern crate bitflags;
+#[macro_use]
 extern crate malloc_size_of;
 #[macro_use]
 extern crate malloc_size_of_derive;
@@ -47,7 +49,7 @@ use msg::constellation_msg::{
 use msg::constellation_msg::{PipelineNamespaceId, TopLevelBrowsingContextId};
 use net_traits::image::base::Image;
 use net_traits::image_cache::ImageCache;
-use net_traits::request::Referrer;
+use net_traits::request::{Referrer, RequestBody};
 use net_traits::storage_thread::StorageType;
 use net_traits::{FetchResponseMsg, ReferrerPolicy, ResourceThreads};
 use pixels::PixelFormat;
@@ -64,16 +66,19 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use style_traits::CSSPixel;
 use style_traits::SpeculativePainter;
+use webgpu::identity::WebGPUMsg;
 use webrender_api::units::{
     DeviceIntSize, DevicePixel, LayoutPixel, LayoutPoint, LayoutSize, WorldPoint,
 };
-use webrender_api::{BuiltDisplayList, DocumentId, ExternalScrollId, ImageKey, ScrollClamping};
-use webrender_api::{BuiltDisplayListDescriptor, HitTestFlags, HitTestResult, ResourceUpdate};
-use webvr_traits::{WebVREvent, WebVRMsg};
+use webrender_api::{
+    BuiltDisplayList, DocumentId, ExternalScrollId, ImageData, ImageDescriptor, ImageKey,
+    ScrollClamping,
+};
+use webrender_api::{BuiltDisplayListDescriptor, HitTestFlags, HitTestResult};
 
 pub use crate::script_msg::{
-    DOMMessage, HistoryEntryReplacement, SWManagerMsg, SWManagerSenders, ScopeThings,
-    ServiceWorkerMsg,
+    DOMMessage, HistoryEntryReplacement, Job, JobError, JobResult, JobResultValue, JobType,
+    SWManagerMsg, SWManagerSenders, ScopeThings, ServiceWorkerMsg,
 };
 pub use crate::script_msg::{
     EventResult, IFrameSize, IFrameSizeMsg, LayoutMsg, LogEntry, ScriptMsg,
@@ -123,8 +128,6 @@ pub enum LayoutControlMsg {
     ExitNow,
     /// Requests the current epoch (layout counter) from this layout.
     GetCurrentEpoch(IpcSender<Epoch>),
-    /// Asks layout to run another step in its animation.
-    TickAnimations(ImmutableOrigin),
     /// Tells layout about the new scrolling offsets of each scrollable stacking context.
     SetScrollStates(Vec<ScrollState>),
     /// Requests the current load state of Web fonts. `true` is returned if fonts are still loading
@@ -168,8 +171,8 @@ pub struct LoadData {
         serialize_with = "::hyper_serde::serialize"
     )]
     pub headers: HeaderMap,
-    /// The data.
-    pub data: Option<Vec<u8>>,
+    /// The data that will be used as the body of the request.
+    pub data: Option<RequestBody>,
     /// The result of evaluating a javascript scheme url.
     pub js_eval_result: Option<JsEvalResult>,
     /// The referrer.
@@ -368,9 +371,7 @@ pub enum ConstellationControlMsg {
     /// Passes a webdriver command to the script thread for execution
     WebDriverScriptCommand(PipelineId, WebDriverScriptCommand),
     /// Notifies script thread that all animations are done
-    TickAllAnimations(PipelineId),
-    /// Notifies the script thread of a transition end
-    TransitionEnd(UntrustedNodeAddress, String, f64),
+    TickAllAnimations(PipelineId, AnimationTickType),
     /// Notifies the script thread that a new Web font has been loaded, and thus the page should be
     /// reflowed.
     WebFontLoaded(PipelineId),
@@ -397,12 +398,12 @@ pub enum ConstellationControlMsg {
     ReportCSSError(PipelineId, String, u32, u32, String),
     /// Reload the given page.
     Reload(PipelineId),
-    /// Notifies the script thread of WebVR events.
-    WebVREvents(PipelineId, Vec<WebVREvent>),
     /// Notifies the script thread about a new recorded paint metric.
     PaintMetric(PipelineId, ProgressiveWebMetricType, u64),
     /// Notifies the media session about a user requested media session action.
     MediaSessionAction(PipelineId, MediaSessionActionType),
+    /// Notifies script thread that WebGPU server has started
+    SetWebGPUPort(IpcReceiver<WebGPUMsg>),
 }
 
 impl fmt::Debug for ConstellationControlMsg {
@@ -432,16 +433,15 @@ impl fmt::Debug for ConstellationControlMsg {
             FocusIFrame(..) => "FocusIFrame",
             WebDriverScriptCommand(..) => "WebDriverScriptCommand",
             TickAllAnimations(..) => "TickAllAnimations",
-            TransitionEnd(..) => "TransitionEnd",
             WebFontLoaded(..) => "WebFontLoaded",
             DispatchIFrameLoadEvent { .. } => "DispatchIFrameLoadEvent",
             DispatchStorageEvent(..) => "DispatchStorageEvent",
             ReportCSSError(..) => "ReportCSSError",
             Reload(..) => "Reload",
-            WebVREvents(..) => "WebVREvents",
             PaintMetric(..) => "PaintMetric",
             ExitFullScreen(..) => "ExitFullScreen",
             MediaSessionAction(..) => "MediaSessionAction",
+            SetWebGPUPort(..) => "SetWebGPUPort",
         };
         write!(formatter, "ConstellationControlMsg::{}", variant)
     }
@@ -669,8 +669,6 @@ pub struct InitialScriptState {
     pub content_process_shutdown_chan: Sender<()>,
     /// A channel to the WebGL thread used in this pipeline.
     pub webgl_chan: Option<WebGLPipeline>,
-    /// A channel to the webvr thread, if available.
-    pub webvr_chan: Option<IpcSender<WebVRMsg>>,
     /// The XR device registry
     pub webxr_registry: webxr_api::Registry,
     /// The Webrender document ID associated with this thread.
@@ -699,11 +697,19 @@ pub trait ScriptThreadFactory {
         relayout_event: bool,
         prepare_for_screenshot: bool,
         unminify_js: bool,
+        local_script_source: Option<String>,
         userscripts_path: Option<String>,
         headless: bool,
         replace_surrogates: bool,
         user_agent: Cow<'static, str>,
     ) -> (Sender<Self::Message>, Receiver<Self::Message>);
+}
+
+/// This trait allows creating a `ServiceWorkerManager` without depending on the `script`
+/// crate.
+pub trait ServiceWorkerManagerFactory {
+    /// Create a `ServiceWorkerManager`.
+    fn create(sw_senders: SWManagerSenders, origin: ImmutableOrigin);
 }
 
 /// Whether the sandbox attribute is present for an iframe element
@@ -763,13 +769,15 @@ pub struct IFrameLoadInfoWithData {
     pub window_size: WindowSizeData,
 }
 
-/// Specifies whether the script or layout thread needs to be ticked for animation.
-#[derive(Debug, Deserialize, Serialize)]
-pub enum AnimationTickType {
-    /// The script thread.
-    Script,
-    /// The layout thread.
-    Layout,
+bitflags! {
+    #[derive(Deserialize, Serialize)]
+    /// Specifies if rAF should be triggered and/or CSS Animations and Transitions.
+    pub struct AnimationTickType: u8 {
+        /// Trigger a call to requestAnimationFrame.
+        const REQUEST_ANIMATION_FRAME = 0b001;
+        /// Trigger restyles for CSS Animations and Transitions.
+        const CSS_ANIMATIONS_AND_TRANSITIONS = 0b010;
+    }
 }
 
 /// The scroll state of a stacking context.
@@ -1118,7 +1126,7 @@ pub enum WebrenderMsg {
     /// provided channel sender.
     GenerateImageKey(IpcSender<ImageKey>),
     /// Perform a resource update operation.
-    UpdateResources(Vec<ResourceUpdate>),
+    UpdateImages(Vec<ImageUpdate>),
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1210,9 +1218,20 @@ impl WebrenderIpcSender {
     }
 
     /// Perform a resource update operation.
-    pub fn update_resources(&self, updates: Vec<ResourceUpdate>) {
-        if let Err(e) = self.0.send(WebrenderMsg::UpdateResources(updates)) {
-            warn!("error sending resource updates: {}", e);
+    pub fn update_images(&self, updates: Vec<ImageUpdate>) {
+        if let Err(e) = self.0.send(WebrenderMsg::UpdateImages(updates)) {
+            warn!("error sending image updates: {}", e);
         }
     }
+}
+
+#[derive(Deserialize, Serialize)]
+/// Serializable image updates that must be performed by WebRender.
+pub enum ImageUpdate {
+    /// Register a new image.
+    AddImage(ImageKey, ImageDescriptor, ImageData),
+    /// Delete a previously registered image registration.
+    DeleteImage(ImageKey),
+    /// Update an existing image registration.
+    UpdateImage(ImageKey, ImageDescriptor, ImageData),
 }

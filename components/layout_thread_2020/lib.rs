@@ -21,14 +21,13 @@ extern crate profile_traits;
 
 mod dom_wrapper;
 
-use crate::dom_wrapper::drop_style_and_layout_data;
 use crate::dom_wrapper::{ServoLayoutDocument, ServoLayoutElement, ServoLayoutNode};
 use app_units::Au;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender};
 use embedder_traits::resources::{self, Resource};
 use euclid::{default::Size2D as UntypedSize2D, Point2D, Rect, Scale, Size2D};
 use fnv::FnvHashMap;
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 use gfx::font_cache_thread::FontCacheThread;
 use gfx::font_context;
 use gfx_traits::{node_id_from_scroll_id, Epoch};
@@ -43,11 +42,10 @@ use layout::query::{
 use layout::query::{process_element_inner_text_query, process_node_geometry_request};
 use layout::query::{process_node_scroll_area_request, process_node_scroll_id_request};
 use layout::query::{
-    process_offset_parent_query, process_resolved_style_request, process_style_query,
-    process_text_index_request,
+    process_offset_parent_query, process_resolved_style_request, process_text_index_request,
 };
 use layout::traversal::RecalcStyle;
-use layout::{BoxTreeRoot, FragmentTreeRoot};
+use layout::{BoxTree, FragmentTree};
 use layout_traits::LayoutThreadFactory;
 use libc::c_void;
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
@@ -65,16 +63,14 @@ use profile_traits::time::{TimerMetadataFrameType, TimerMetadataReflowType};
 use script_layout_interface::message::{LayoutThreadInit, Msg, NodesFromPointQueryType};
 use script_layout_interface::message::{QueryMsg, ReflowComplete, ReflowGoal, ScriptReflow};
 use script_layout_interface::rpc::TextIndexResponse;
-use script_layout_interface::rpc::{LayoutRPC, OffsetParentResponse, StyleResponse};
+use script_layout_interface::rpc::{LayoutRPC, OffsetParentResponse};
 use script_traits::{ConstellationControlMsg, LayoutControlMsg, LayoutMsg as ConstellationMsg};
 use script_traits::{DrawAPaintImageResult, PaintWorkletError};
 use script_traits::{Painter, WebrenderIpcSender};
 use script_traits::{ScrollState, UntrustedNodeAddress, WindowSizeData};
-use selectors::Element;
 use servo_arc::Arc as ServoArc;
 use servo_atoms::Atom;
 use servo_config::opts;
-use servo_config::pref;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -84,14 +80,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
-use style::animation::Animation;
-use style::context::{QuirksMode, RegisteredSpeculativePainter, RegisteredSpeculativePainters};
-use style::context::{SharedStyleContext, ThreadLocalStyleContextCreationInfo};
+use style::animation::ElementAnimationSet;
+use style::context::{
+    QuirksMode, RegisteredSpeculativePainter, RegisteredSpeculativePainters, SharedStyleContext,
+};
+use style::dom::OpaqueNode;
 use style::dom::{TDocument, TElement, TNode};
 use style::driver;
 use style::error_reporting::RustLogReporter;
 use style::global_style_data::{GLOBAL_STYLE_DATA, STYLE_THREAD_POOL};
-use style::invalidation::element::restyle_hints::RestyleHint;
 use style::media_queries::{Device, MediaList, MediaType};
 use style::properties::PropertyId;
 use style::selector_parser::SnapshotMap;
@@ -101,7 +98,6 @@ use style::stylesheets::{
 };
 use style::stylist::Stylist;
 use style::thread_state::{self, ThreadState};
-use style::timer::Timer;
 use style::traversal::DomTraversal;
 use style::traversal_flags::TraversalFlags;
 use style_traits::CSSPixel;
@@ -162,21 +158,14 @@ pub struct LayoutThread {
     /// This can be used to easily check for invalid stale data.
     generation: Cell<u32>,
 
-    /// A channel on which new animations that have been triggered by style recalculation can be
-    /// sent.
-    new_animations_sender: Sender<Animation>,
-
-    /// Receives newly-discovered animations.
-    _new_animations_receiver: Receiver<Animation>,
-
     /// The number of Web fonts that have been requested but not yet loaded.
     outstanding_web_fonts: Arc<AtomicUsize>,
 
-    /// The root of the box tree.
-    box_tree_root: RefCell<Option<Arc<BoxTreeRoot>>>,
+    /// The box tree.
+    box_tree: RefCell<Option<Arc<BoxTree>>>,
 
-    /// The root of the fragment tree.
-    fragment_tree_root: RefCell<Option<Arc<FragmentTreeRoot>>>,
+    /// The fragment tree.
+    fragment_tree: RefCell<Option<Arc<FragmentTree>>>,
 
     /// The document-specific shared lock used for author-origin stylesheets
     document_shared_lock: Option<SharedRwLock>,
@@ -204,10 +193,6 @@ pub struct LayoutThread {
 
     /// Webrender document.
     webrender_document: webrender_api::DocumentId,
-
-    /// The timer object to control the timing of the animations. This should
-    /// only be a test-mode timer during testing for animations.
-    timer: Timer,
 
     /// Paint time metrics.
     paint_time_metrics: PaintTimeMetrics,
@@ -502,9 +487,6 @@ impl LayoutThread {
             window_size.device_pixel_ratio,
         );
 
-        // Create the channel on which new animations can be sent.
-        let (new_animations_sender, new_animations_receiver) = unbounded();
-
         // Proxy IPC messages from the pipeline to the layout thread.
         let pipeline_receiver = ROUTER.route_ipc_receiver_to_new_crossbeam_receiver(pipeline_port);
 
@@ -531,11 +513,9 @@ impl LayoutThread {
             font_cache_receiver: font_cache_receiver,
             font_cache_sender: ipc_font_cache_sender,
             generation: Cell::new(0),
-            new_animations_sender: new_animations_sender,
-            _new_animations_receiver: new_animations_receiver,
             outstanding_web_fonts: Arc::new(AtomicUsize::new(0)),
-            box_tree_root: Default::default(),
-            fragment_tree_root: Default::default(),
+            box_tree: Default::default(),
+            fragment_tree: Default::default(),
             document_shared_lock: None,
             // Epoch starts at 1 because of the initial display list for epoch 0 that we send to WR
             epoch: Cell::new(Epoch(1)),
@@ -553,7 +533,6 @@ impl LayoutThread {
                 scroll_area_response: Rect::zero(),
                 resolved_style_response: String::new(),
                 offset_parent_response: OffsetParentResponse::empty(),
-                style_response: StyleResponse(None),
                 scroll_offsets: HashMap::new(),
                 text_index_response: TextIndexResponse(None),
                 nodes_from_point_response: vec![],
@@ -561,11 +540,6 @@ impl LayoutThread {
                 inner_window_dimensions_response: None,
             })),
             webrender_image_cache: Default::default(),
-            timer: if pref!(layout.animations.test.enabled) {
-                Timer::test_mode()
-            } else {
-                Timer::new()
-            },
             paint_time_metrics: paint_time_metrics,
             busy,
             load_webfonts_synchronously,
@@ -596,12 +570,16 @@ impl LayoutThread {
     fn build_layout_context<'a>(
         &'a self,
         guards: StylesheetGuards<'a>,
-        script_initiated_layout: bool,
         snapshot_map: &'a SnapshotMap,
         origin: ImmutableOrigin,
+        animation_timeline_value: f64,
+        animation_states: ServoArc<RwLock<FxHashMap<OpaqueNode, ElementAnimationSet>>>,
+        stylesheets_changed: bool,
     ) -> LayoutContext<'a> {
-        let thread_local_style_context_creation_data =
-            ThreadLocalStyleContextCreationInfo::new(self.new_animations_sender.clone());
+        let traversal_flags = match stylesheets_changed {
+            true => TraversalFlags::ForCSSRuleChanges,
+            false => TraversalFlags::empty(),
+        };
 
         LayoutContext {
             id: self.id,
@@ -611,22 +589,16 @@ impl LayoutThread {
                 options: GLOBAL_STYLE_DATA.options.clone(),
                 guards,
                 visited_styles_enabled: false,
-                running_animations: Default::default(),
-                expired_animations: Default::default(),
+                animation_states,
                 registered_speculative_painters: &self.registered_painters,
-                local_context_creation_data: Mutex::new(thread_local_style_context_creation_data),
-                timer: self.timer.clone(),
-                traversal_flags: TraversalFlags::empty(),
+                current_time_for_animations: animation_timeline_value,
+                traversal_flags,
                 snapshot_map: snapshot_map,
             },
             image_cache: self.image_cache.clone(),
             font_cache_thread: Mutex::new(self.font_cache_thread.clone()),
             webrender_image_cache: self.webrender_image_cache.clone(),
-            pending_images: if script_initiated_layout {
-                Some(Mutex::new(Vec::new()))
-            } else {
-                None
-            },
+            pending_images: Mutex::new(vec![]),
             use_rayon: STYLE_THREAD_POOL.pool().is_some(),
         }
     }
@@ -638,9 +610,6 @@ impl LayoutThread {
             Msg::SetQuirksMode(..) => LayoutHangAnnotation::SetQuirksMode,
             Msg::Reflow(..) => LayoutHangAnnotation::Reflow,
             Msg::GetRPC(..) => LayoutHangAnnotation::GetRPC,
-            Msg::TickAnimations(..) => LayoutHangAnnotation::TickAnimations,
-            Msg::AdvanceClockMs(..) => LayoutHangAnnotation::AdvanceClockMs,
-            Msg::ReapStyleAndLayoutData(..) => LayoutHangAnnotation::ReapStyleAndLayoutData,
             Msg::CollectReports(..) => LayoutHangAnnotation::CollectReports,
             Msg::PrepareToExit(..) => LayoutHangAnnotation::PrepareToExit,
             Msg::ExitNow => LayoutHangAnnotation::ExitNow,
@@ -654,7 +623,6 @@ impl LayoutThread {
             },
             Msg::RegisterPaint(..) => LayoutHangAnnotation::RegisterPaint,
             Msg::SetNavigationStart(..) => LayoutHangAnnotation::SetNavigationStart,
-            Msg::GetRunningAnimations(..) => LayoutHangAnnotation::GetRunningAnimations,
         };
         self.background_hang_monitor
             .as_ref()
@@ -687,9 +655,6 @@ impl LayoutThread {
                     Msg::SetScrollStates(new_scroll_states),
                     possibly_locked_rw_data,
                 ),
-            Request::FromPipeline(LayoutControlMsg::TickAnimations(origin)) => {
-                self.handle_request_helper(Msg::TickAnimations(origin), possibly_locked_rw_data)
-            },
             Request::FromPipeline(LayoutControlMsg::GetCurrentEpoch(sender)) => {
                 self.handle_request_helper(Msg::GetCurrentEpoch(sender), possibly_locked_rw_data)
             },
@@ -761,7 +726,6 @@ impl LayoutThread {
                     || self.handle_reflow(&mut data, possibly_locked_rw_data),
                 );
             },
-            Msg::TickAnimations(origin) => self.tick_all_animations(origin),
             Msg::SetScrollStates(new_scroll_states) => {
                 self.set_scroll_states(new_scroll_states, possibly_locked_rw_data);
             },
@@ -779,18 +743,12 @@ impl LayoutThread {
                     webrender_api::ScrollClamping::ToContentBounds,
                 );
             },
-            Msg::ReapStyleAndLayoutData(dead_data) => unsafe {
-                drop_style_and_layout_data(dead_data)
-            },
             Msg::CollectReports(reports_chan) => {
                 self.collect_reports(reports_chan, possibly_locked_rw_data);
             },
             Msg::GetCurrentEpoch(sender) => {
                 let _rw_data = possibly_locked_rw_data.lock();
                 sender.send(self.epoch.get()).unwrap();
-            },
-            Msg::AdvanceClockMs(how_many, do_tick, origin) => {
-                self.handle_advance_clock_ms(how_many, do_tick, origin);
             },
             Msg::GetWebFontLoadState(sender) => {
                 let _rw_data = possibly_locked_rw_data.lock();
@@ -814,9 +772,6 @@ impl LayoutThread {
             },
             Msg::SetNavigationStart(time) => {
                 self.paint_time_metrics.set_navigation_start(time);
-            },
-            Msg::GetRunningAnimations(sender) => {
-                let _ = sender.send(0);
             },
         }
 
@@ -890,9 +845,6 @@ impl LayoutThread {
         response_chan.send(()).unwrap();
         loop {
             match self.port.recv().unwrap() {
-                Msg::ReapStyleAndLayoutData(dead_data) => unsafe {
-                    drop_style_and_layout_data(dead_data)
-                },
                 Msg::ExitNow => {
                     debug!("layout thread is exiting...");
                     self.exit_now();
@@ -928,19 +880,6 @@ impl LayoutThread {
         }
     }
 
-    /// Advances the animation clock of the document.
-    fn handle_advance_clock_ms<'a, 'b>(
-        &mut self,
-        how_many_ms: i32,
-        tick_animations: bool,
-        origin: ImmutableOrigin,
-    ) {
-        self.timer.increment(how_many_ms as f64 / 1000.0);
-        if tick_animations {
-            self.tick_all_animations(origin);
-        }
-    }
-
     /// Sets quirks mode for the document, causing the quirks mode stylesheet to be used.
     fn handle_set_quirks_mode<'a, 'b>(&mut self, quirks_mode: QuirksMode) {
         self.stylist.set_quirks_mode(quirks_mode);
@@ -957,7 +896,7 @@ impl LayoutThread {
 
         let mut rw_data = possibly_locked_rw_data.lock();
 
-        let element = match document.root_element() {
+        let root_element = match document.root_element() {
             None => {
                 // Since we cannot compute anything, give spec-required placeholders.
                 debug!("layout: No root node: bailing");
@@ -987,9 +926,7 @@ impl LayoutThread {
                         &QueryMsg::OffsetParentQuery(_) => {
                             rw_data.offset_parent_response = OffsetParentResponse::empty();
                         },
-                        &QueryMsg::StyleQuery(_) => {
-                            rw_data.style_response = StyleResponse(None);
-                        },
+                        &QueryMsg::StyleQuery => {},
                         &QueryMsg::TextIndexQuery(..) => {
                             rw_data.text_index_response = TextIndexResponse(None);
                         },
@@ -1030,7 +967,6 @@ impl LayoutThread {
             ua_or_user: &ua_or_user_guard,
         };
 
-        let had_used_viewport_units = self.stylist.device().used_viewport_units();
         let device = Device::new(MediaType::screen(), initial_viewport, device_pixel_ratio);
         let sheet_origins_affected_by_device_change = self.stylist.set_device(device, &guards);
 
@@ -1057,11 +993,6 @@ impl LayoutThread {
                         constraints.clone(),
                     ))
                     .unwrap();
-            }
-            if had_used_viewport_units {
-                if let Some(mut data) = element.mutate_data() {
-                    data.hint.insert(RestyleHint::recascade_subtree());
-                }
             }
         }
 
@@ -1096,26 +1027,22 @@ impl LayoutThread {
             guards.author.clone(),
         );
 
-        let restyles = document.drain_pending_restyles();
+        let restyles = std::mem::take(&mut data.pending_restyles);
+        debug!("Draining restyles: {}", restyles.len());
 
         let mut map = SnapshotMap::new();
         let elements_with_snapshot: Vec<_> = restyles
             .iter()
             .filter(|r| r.1.snapshot.is_some())
-            .map(|r| r.0)
+            .map(|r| unsafe { ServoLayoutNode::new(&r.0).as_element().unwrap() })
             .collect();
 
         for (el, restyle) in restyles {
-            // Propagate the descendant bit up the ancestors. Do this before
-            // the restyle calculation so that we can also do it for new
-            // unstyled nodes, which the descendants bit helps us find.
-            if let Some(parent) = el.parent_element() {
-                unsafe { parent.note_dirty_descendant() };
-            }
+            let el = unsafe { ServoLayoutNode::new(&el).as_element().unwrap() };
 
             // If we haven't styled this node yet, we don't need to track a
             // restyle.
-            let style_data = match el.get_data() {
+            let mut style_data = match el.mutate_data() {
                 Some(d) => d,
                 None => {
                     unsafe { el.unset_snapshot_flags() };
@@ -1128,60 +1055,75 @@ impl LayoutThread {
                 map.insert(el.as_node().opaque(), s);
             }
 
-            let mut style_data = style_data.borrow_mut();
-
             // Stash the data on the element for processing by the style system.
             style_data.hint.insert(restyle.hint.into());
             style_data.damage = restyle.damage;
             debug!("Noting restyle for {:?}: {:?}", el, style_data);
         }
 
-        self.stylist.flush(&guards, Some(element), Some(&map));
+        self.stylist.flush(&guards, Some(root_element), Some(&map));
 
         // Create a layout context for use throughout the following passes.
-        let mut layout_context = self.build_layout_context(guards.clone(), true, &map, origin);
+        let mut layout_context = self.build_layout_context(
+            guards.clone(),
+            &map,
+            origin,
+            data.animation_timeline_value,
+            data.animations.clone(),
+            data.stylesheets_changed,
+        );
+
+        let dirty_root = unsafe {
+            ServoLayoutNode::new(&data.dirty_root.unwrap())
+                .as_element()
+                .unwrap()
+        };
 
         let traversal = RecalcStyle::new(layout_context);
         let token = {
             let shared = DomTraversal::<ServoLayoutElement>::shared_context(&traversal);
-            RecalcStyle::pre_traverse(element, shared)
+            RecalcStyle::pre_traverse(dirty_root, shared)
         };
 
         let rayon_pool = STYLE_THREAD_POOL.pool();
         let rayon_pool = rayon_pool.as_ref();
 
-        let box_tree = if token.should_traverse() {
-            driver::traverse_dom(&traversal, token, rayon_pool);
+        if token.should_traverse() {
+            let dirty_root = driver::traverse_dom(&traversal, token, rayon_pool).as_node();
 
-            let root_node = document.root_element().unwrap().as_node();
-            let build_box_tree = || BoxTreeRoot::construct(traversal.context(), root_node);
-            let box_tree = if let Some(pool) = rayon_pool {
+            let root_node = root_element.as_node();
+            let mut box_tree = self.box_tree.borrow_mut();
+            let box_tree = &mut *box_tree;
+            let mut build_box_tree = || {
+                if !BoxTree::update(traversal.context(), dirty_root) {
+                    *box_tree = Some(Arc::new(BoxTree::construct(traversal.context(), root_node)));
+                }
+            };
+            if let Some(pool) = rayon_pool {
                 pool.install(build_box_tree)
             } else {
                 build_box_tree()
             };
 
-            Some(Arc::new(box_tree))
-        } else {
-            None
-        };
-
-        layout_context = traversal.destroy();
-
-        if let Some(box_tree) = box_tree {
             let viewport_size = Size2D::new(
                 self.viewport_size.width.to_f32_px(),
                 self.viewport_size.height.to_f32_px(),
             );
-            let run_layout = || box_tree.layout(&layout_context, viewport_size);
+            let run_layout = || {
+                box_tree
+                    .as_ref()
+                    .unwrap()
+                    .layout(traversal.context(), viewport_size)
+            };
             let fragment_tree = Arc::new(if let Some(pool) = rayon_pool {
                 pool.install(run_layout)
             } else {
                 run_layout()
             });
-            *self.box_tree_root.borrow_mut() = Some(box_tree);
-            *self.fragment_tree_root.borrow_mut() = Some(fragment_tree);
+            *self.fragment_tree.borrow_mut() = Some(fragment_tree);
         }
+
+        layout_context = traversal.destroy();
 
         for element in elements_with_snapshot {
             unsafe { element.unset_snapshot_flags() }
@@ -1190,7 +1132,7 @@ impl LayoutThread {
         if self.dump_style_tree {
             println!(
                 "{:?}",
-                style::dom::ShowSubtreeDataAndPrimaryValues(element.as_node())
+                style::dom::ShowSubtreeDataAndPrimaryValues(root_element.as_node())
             );
         }
 
@@ -1203,12 +1145,10 @@ impl LayoutThread {
         }
 
         // GC the rule tree if some heuristics are met.
-        unsafe {
-            layout_context.style_context.stylist.rule_tree().maybe_gc();
-        }
+        layout_context.style_context.stylist.rule_tree().maybe_gc();
 
         // Perform post-style recalculation layout passes.
-        if let Some(root) = &*self.fragment_tree_root.borrow() {
+        if let Some(root) = &*self.fragment_tree.borrow() {
             self.perform_post_style_recalc_layout_passes(
                 root.clone(),
                 &data.reflow_goal,
@@ -1233,16 +1173,14 @@ impl LayoutThread {
         context: &mut LayoutContext,
         reflow_result: &mut ReflowComplete,
     ) {
-        let pending_images = match &context.pending_images {
-            Some(pending) => std::mem::take(&mut *pending.lock().unwrap()),
-            None => Vec::new(),
-        };
-        reflow_result.pending_images = pending_images;
+        reflow_result.pending_images =
+            std::mem::replace(&mut *context.pending_images.lock().unwrap(), vec![]);
+
         match *reflow_goal {
             ReflowGoal::LayoutQuery(ref querymsg, _) => match querymsg {
                 &QueryMsg::ContentBoxQuery(node) => {
                     rw_data.content_box_response =
-                        process_content_box_request(node, self.fragment_tree_root.borrow().clone());
+                        process_content_box_request(node, self.fragment_tree.borrow().clone());
                 },
                 &QueryMsg::ContentBoxesQuery(node) => {
                     rw_data.content_boxes_response = process_content_boxes_request(node);
@@ -1255,10 +1193,8 @@ impl LayoutThread {
                     rw_data.text_index_response = process_text_index_request(node, point_in_node);
                 },
                 &QueryMsg::ClientRectQuery(node) => {
-                    rw_data.client_rect_response = process_node_geometry_request(
-                        node,
-                        self.fragment_tree_root.borrow().clone(),
-                    );
+                    rw_data.client_rect_response =
+                        process_node_geometry_request(node, self.fragment_tree.borrow().clone());
                 },
                 &QueryMsg::NodeScrollGeometryQuery(node) => {
                     rw_data.scroll_area_response = process_node_scroll_area_request(node);
@@ -1270,16 +1206,19 @@ impl LayoutThread {
                 },
                 &QueryMsg::ResolvedStyleQuery(node, ref pseudo, ref property) => {
                     let node = unsafe { ServoLayoutNode::new(&node) };
-                    rw_data.resolved_style_response =
-                        process_resolved_style_request(context, node, pseudo, property);
+                    let fragment_tree = self.fragment_tree.borrow().clone();
+                    rw_data.resolved_style_response = process_resolved_style_request(
+                        context,
+                        node,
+                        pseudo,
+                        property,
+                        fragment_tree,
+                    );
                 },
                 &QueryMsg::OffsetParentQuery(node) => {
                     rw_data.offset_parent_response = process_offset_parent_query(node);
                 },
-                &QueryMsg::StyleQuery(node) => {
-                    let node = unsafe { ServoLayoutNode::new(&node) };
-                    rw_data.style_response = process_style_query(node);
-                },
+                &QueryMsg::StyleQuery => {},
                 &QueryMsg::NodesFromPointQuery(client_point, ref reflow_goal) => {
                     let mut flags = match reflow_goal {
                         &NodesFromPointQueryType::Topmost => webrender_api::HitTestFlags::empty(),
@@ -1345,50 +1284,20 @@ impl LayoutThread {
         rw_data.scroll_offsets = layout_scroll_states
     }
 
-    fn tick_all_animations<'a, 'b>(&mut self, origin: ImmutableOrigin) {
-        self.tick_animations(origin);
-    }
-
-    fn tick_animations(&mut self, origin: ImmutableOrigin) {
-        if self.relayout_event {
-            println!(
-                "**** pipeline={}\tForDisplay\tSpecial\tAnimationTick",
-                self.id
-            );
-        }
-
-        if let Some(root) = &*self.fragment_tree_root.borrow() {
-            // Unwrap here should not panic since self.fragment_tree_root is only ever set to Some(_)
-            // in handle_reflow() where self.document_shared_lock is as well.
-            let author_shared_lock = self.document_shared_lock.clone().unwrap();
-            let author_guard = author_shared_lock.read();
-            let ua_or_user_guard = UA_STYLESHEETS.shared_lock.read();
-            let guards = StylesheetGuards {
-                author: &author_guard,
-                ua_or_user: &ua_or_user_guard,
-            };
-            let snapshots = SnapshotMap::new();
-            let mut layout_context = self.build_layout_context(guards, false, &snapshots, origin);
-
-            self.perform_post_style_recalc_layout_passes(
-                root.clone(),
-                &ReflowGoal::TickAnimations,
-                None,
-                &mut layout_context,
-            );
-            assert!(layout_context.pending_images.is_none());
-        }
-    }
-
     fn perform_post_style_recalc_layout_passes(
         &self,
-        fragment_tree: Arc<FragmentTreeRoot>,
+        fragment_tree: Arc<FragmentTree>,
         reflow_goal: &ReflowGoal,
         document: Option<&ServoLayoutDocument>,
         context: &mut LayoutContext,
     ) {
+        Self::cancel_animations_for_nodes_not_in_fragment_tree(
+            &mut *(context.style_context.animation_states.write()),
+            &fragment_tree,
+        );
+
         if self.trace_layout {
-            if let Some(box_tree) = &*self.box_tree_root.borrow() {
+            if let Some(box_tree) = &*self.box_tree.borrow() {
                 layout_debug::begin_trace(box_tree.clone(), fragment_tree.clone());
             }
         }
@@ -1408,21 +1317,22 @@ impl LayoutThread {
             document.will_paint();
         }
 
-        let mut display_list = DisplayListBuilder::new(
-            self.id.to_webrender(),
-            context,
-            fragment_tree.scrollable_overflow(),
-        );
+        let mut display_list =
+            DisplayListBuilder::new(self.id.to_webrender(), context, &fragment_tree);
+
+        // `dump_serialized_display_list` doesn't actually print anything. It sets up
+        // the display list for printing the serialized version when `finalize()` is called.
+        // We need to call this before adding any display items so that they are printed
+        // during `finalize()`.
+        if self.dump_display_list {
+            display_list.wr.dump_serialized_display_list();
+        }
 
         fragment_tree.build_display_list(&mut display_list);
 
         if self.dump_flow_tree {
             fragment_tree.print();
         }
-        if self.dump_display_list {
-            display_list.wr.dump_serialized_display_list();
-        }
-
         debug!("Layout done!");
 
         let mut epoch = self.epoch.get();
@@ -1468,6 +1378,25 @@ impl LayoutThread {
                 TimerMetadataReflowType::Incremental
             },
         })
+    }
+
+    /// Cancel animations for any nodes which have been removed from fragment tree.
+    /// TODO(mrobinson): We should look into a way of doing this during flow tree construction.
+    /// This also doesn't yet handles nodes that have been reparented.
+    fn cancel_animations_for_nodes_not_in_fragment_tree(
+        animation_states: &mut FxHashMap<OpaqueNode, ElementAnimationSet>,
+        root: &FragmentTree,
+    ) {
+        // Assume all nodes have been removed until proven otherwise.
+        let mut invalid_nodes: FxHashSet<OpaqueNode> = animation_states.keys().cloned().collect();
+        root.remove_nodes_in_fragment_tree_from_set(&mut invalid_nodes);
+
+        // Cancel animations for any nodes that are no longer in the fragment tree.
+        for node in &invalid_nodes {
+            if let Some(state) = animation_states.get_mut(node) {
+                state.cancel_all_animations();
+            }
+        }
     }
 }
 

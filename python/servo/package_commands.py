@@ -12,6 +12,7 @@ from __future__ import absolute_import, print_function, unicode_literals
 from datetime import datetime
 import base64
 import hashlib
+import io
 import json
 import os
 import os.path as path
@@ -31,7 +32,7 @@ from mach.decorators import (
 from mach.registrar import Registrar
 # Note: mako cannot be imported at the top level because it breaks mach bootstrap
 sys.path.append(path.join(path.dirname(__file__), "..", "..",
-                          "components", "style", "properties", "Mako-0.9.1.zip"))
+                          "components", "style", "properties", "Mako-1.1.2-py2.py3-none-any.whl"))
 
 from servo.command_base import (
     archive_deterministically,
@@ -70,7 +71,7 @@ PACKAGES = {
         r'target\release\msi\Servo.zip',
     ],
     'uwp': [
-        r'support\hololens\AppPackages\ServoApp\ServoApp_1.0.0.0_Test.zip',
+        r'support\hololens\AppPackages\ServoApp\FirefoxReality.zip',
     ],
 }
 
@@ -630,12 +631,27 @@ class PackageCommands(CommandBase):
             extension = path.basename(package).partition('.')[2]
             latest_upload_key = '{}/servo-latest.{}'.format(nightly_dir, extension)
 
+            # Compute the hash
+            SHA_BUF_SIZE = 1048576  # read in 1 MiB chunks
+            sha256_digest = hashlib.sha256()
+            with open(package, 'rb') as package_file:
+                while True:
+                    data = package_file.read(SHA_BUF_SIZE)
+                    if not data:
+                        break
+                    sha256_digest.update(data)
+            package_hash = sha256_digest.hexdigest()
+            package_hash_fileobj = io.BytesIO(package_hash)
+            latest_hash_upload_key = '{}/servo-latest.{}.sha256'.format(nightly_dir, extension)
+
             s3.upload_file(package, BUCKET, package_upload_key)
+
             copy_source = {
                 'Bucket': BUCKET,
                 'Key': package_upload_key,
             }
             s3.copy(copy_source, BUCKET, latest_upload_key)
+            s3.upload_fileobj(package_hash_fileobj, BUCKET, latest_hash_upload_key)
 
         def update_maven(directory):
             (aws_access_key, aws_secret_access_key) = get_s3_secret()
@@ -743,7 +759,7 @@ class PackageCommands(CommandBase):
         return 0
 
 
-def setup_uwp_signing(ms_app_store):
+def setup_uwp_signing(ms_app_store, publisher):
     # App package needs to be signed. If we find a certificate that has been installed
     # already, we use it. Otherwise we create and install a temporary certificate.
 
@@ -766,11 +782,6 @@ def setup_uwp_signing(ms_app_store):
         run_powershell_cmd('Import-PfxCertificate -FilePath .\servo.pfx -CertStoreLocation Cert:\CurrentUser\My')
         os.remove("servo.pfx")
 
-    # Parse appxmanifest to find the publisher name
-    manifest_file = path.join(os.getcwd(), 'support', 'hololens', 'ServoApp', 'Package.appxmanifest')
-    manifest = xml.etree.ElementTree.parse(manifest_file)
-    namespace = "{http://schemas.microsoft.com/appx/manifest/foundation/windows10}"
-    publisher = manifest.getroot().find(namespace + "Identity").attrib["Publisher"]
     # Powershell command that lists all certificates for publisher
     cmd = '(dir cert: -Recurse | Where-Object {$_.Issuer -eq "' + publisher + '"}).Thumbprint'
     certs = list(set(run_powershell_cmd(cmd).splitlines()))
@@ -806,6 +817,14 @@ def build_uwp(platforms, dev, msbuild_dir, ms_app_store):
     else:
         Configuration = "Release"
 
+    # Parse appxmanifest to find the publisher name and version
+    manifest_file = path.join(os.getcwd(), 'support', 'hololens', 'ServoApp', 'Package.appxmanifest')
+    manifest = xml.etree.ElementTree.parse(manifest_file)
+    namespace = "{http://schemas.microsoft.com/appx/manifest/foundation/windows10}"
+    identity = manifest.getroot().find(namespace + "Identity")
+    publisher = identity.attrib["Publisher"]
+    version = identity.attrib["Version"]
+
     msbuild = path.join(msbuild_dir, "msbuild.exe")
     build_file_template = path.join('support', 'hololens', 'package.msbuild')
     with open(build_file_template) as f:
@@ -820,14 +839,16 @@ def build_uwp(platforms, dev, msbuild_dir, ms_app_store):
         )
         build_file.close()
         # Generate an appxbundle.
-        msbuild_args = setup_uwp_signing(ms_app_store)
+        msbuild_args = setup_uwp_signing(ms_app_store, publisher)
         subprocess.check_call([msbuild, "/m", build_file.name] + msbuild_args)
         os.unlink(build_file.name)
 
-    print("Creating ZIP")
-    out_dir = path.join(os.getcwd(), 'support', 'hololens', 'AppPackages', 'ServoApp')
-    name = 'ServoApp_1.0.0.0_%sTest' % ('Debug_' if dev else '')
-    artifacts_dir = path.join(out_dir, name)
-    zip_path = path.join(out_dir, name + ".zip")
-    archive_deterministically(artifacts_dir, zip_path, prepend_path='servo/')
-    print("Packaged Servo into " + zip_path)
+    # Don't bother creating an archive that contains unsigned app packages.
+    if not ms_app_store:
+        print("Creating ZIP")
+        out_dir = path.join(os.getcwd(), 'support', 'hololens', 'AppPackages', 'ServoApp')
+        name = 'ServoApp_%s_%sTest' % (version, 'Debug_' if dev else '')
+        artifacts_dir = path.join(out_dir, name)
+        zip_path = path.join(out_dir, "FirefoxReality.zip")
+        archive_deterministically(artifacts_dir, zip_path, prepend_path='servo/')
+        print("Packaged Servo into " + zip_path)

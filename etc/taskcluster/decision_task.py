@@ -6,6 +6,7 @@
 
 import os.path
 import decisionlib
+import functools
 from decisionlib import CONFIG, SHARED
 
 
@@ -62,6 +63,10 @@ def tasks(task_for):
             "try-wpt-2020": [linux_wpt_layout_2020],
             "try-wpt-mac": [macos_wpt],
         }
+        by_branch_name["try-windows-rdp"] = [
+            functools.partial(f, rdp=True) for f in by_branch_name["try-windows"]
+        ]
+
         for function in by_branch_name.get(branch, []):
             function()
 
@@ -80,7 +85,7 @@ def tasks(task_for):
     elif task_for == "try-windows-ami":
         CONFIG.git_sha_is_current_head()
         CONFIG.windows_worker_type = os.environ["NEW_AMI_WORKER_TYPE"]
-        windows_unit(cached=False)
+        windows_unit(cached=False, rdp=True)
 
     # https://tools.taskcluster.net/hooks/project-servo/daily
     elif task_for == "daily":
@@ -99,13 +104,13 @@ build_dependencies_artifacts_expire_in = "1 month"
 log_artifacts_expire_in = "1 year"
 
 build_env = {
-    "RUST_BACKTRACE": "1",
     "RUSTFLAGS": "-Dwarnings",
     "CARGO_INCREMENTAL": "0",
 }
 unix_build_env = {
 }
 linux_build_env = {
+    "RUST_BACKTRACE": "1", # https://github.com/servo/servo/issues/26192
     "SHELL": "/bin/dash",  # For SpiderMonkey’s build system
     "CCACHE": "sccache",
     "RUSTC_WRAPPER": "sccache",
@@ -255,12 +260,13 @@ def layout_2020_regressions_report():
         .with_dockerfile(dockerfile_path("base"))
         .with_repo_bundle()
         .with_script(
-            "python3 etc/layout-2020-regressions/gen.py %s %s"
+            "python3 tests/wpt/reftests-report/gen.py %s %s"
             % (CONFIG.tree_hash(), CONFIG.git_sha)
         )
         .with_index_and_artifacts_expire_in(log_artifacts_expire_in)
-        .with_artifacts("/repo/etc/layout-2020-regressions/regressions.html")
-        .find_or_create("layout-2020-regressions-report")
+        .with_artifacts("/repo/tests/wpt/reftests-report/report.html")
+        .with_index_at("layout-2020-regressions-report")
+        .create()
     )
 
 def macos_unit():
@@ -296,20 +302,19 @@ def with_rust_nightly():
     )
 
 
-def appx_artifact(debug):
-    return '/'.join([
-        'repo',
-        'support',
-        'hololens',
-        'AppPackages',
-        'ServoApp',
-        'ServoApp_1.0.0.0_%sTest.zip' % ('Debug_' if debug else ''),
-    ])
+appx_artifact = '/'.join([
+    'repo',
+    'support',
+    'hololens',
+    'AppPackages',
+    'ServoApp',
+    'FirefoxReality.zip',
+])
 
 
-def windows_arm64():
+def windows_arm64(rdp=False):
     return (
-        windows_build_task("UWP dev build", arch="arm64", package=False)
+        windows_build_task("UWP dev build", arch="arm64", package=False, rdp=rdp)
         .with_treeherder("Windows arm64", "UWP-Dev")
         .with_features("taskclusterProxy")
         .with_scopes("secrets:get:project/servo/windows-codesign-cert/latest")
@@ -317,14 +322,14 @@ def windows_arm64():
             "python mach build --dev --target=aarch64-uwp-windows-msvc",
             "python mach package --dev --target aarch64-uwp-windows-msvc --uwp=arm64",
         )
-        .with_artifacts(appx_artifact(debug=True))
+        .with_artifacts(appx_artifact)
         .find_or_create("build.windows_uwp_arm64_dev." + CONFIG.tree_hash())
     )
 
 
-def windows_uwp_x64():
+def windows_uwp_x64(rdp=False):
     return (
-        windows_build_task("UWP dev build", package=False)
+        windows_build_task("UWP dev build", package=False, rdp=rdp)
         .with_treeherder("Windows x64", "UWP-Dev")
         .with_features("taskclusterProxy")
         .with_scopes("secrets:get:project/servo/windows-codesign-cert/latest")
@@ -333,14 +338,14 @@ def windows_uwp_x64():
             "python mach package --dev --target=x86_64-uwp-windows-msvc --uwp=x64",
             "python mach test-tidy --force-cpp --no-wpt",
         )
-        .with_artifacts(appx_artifact(debug=True))
+        .with_artifacts(appx_artifact)
         .find_or_create("build.windows_uwp_x64_dev." + CONFIG.tree_hash())
     )
 
 
-def uwp_nightly():
+def uwp_nightly(rdp=False):
     return (
-        windows_build_task("Nightly UWP build and upload", package=False)
+        windows_build_task("Nightly UWP build and upload", package=False, rdp=rdp)
         .with_treeherder("Windows x64", "UWP-Nightly")
         .with_features("taskclusterProxy")
         .with_scopes(
@@ -353,15 +358,15 @@ def uwp_nightly():
             "mach package --release --target=x86_64-uwp-windows-msvc --uwp=x64 --uwp=arm64",
             "mach upload-nightly uwp --secret-from-taskcluster",
         )
-        .with_artifacts(appx_artifact(debug=False))
+        .with_artifacts(appx_artifact)
         .with_max_run_time_minutes(3 * 60)
         .find_or_create("build.windows_uwp_nightlies." + CONFIG.tree_hash())
     )
 
 
-def windows_unit(cached=True):
+def windows_unit(cached=True, rdp=False):
     task = (
-        windows_build_task("Dev build + unit tests")
+        windows_build_task("Dev build + unit tests", rdp=rdp)
         .with_treeherder("Windows x64", "Unit")
         .with_script(
             # Not necessary as this would be done at the start of `build`,
@@ -389,9 +394,9 @@ def windows_unit(cached=True):
         return task.create()
 
 
-def windows_nightly():
+def windows_nightly(rdp=False):
     return (
-        windows_build_task("Nightly build and upload")
+        windows_build_task("Nightly build and upload", rdp=rdp)
         .with_treeherder("Windows x64", "Nightly")
         .with_features("taskclusterProxy")
         .with_scopes("secrets:get:project/servo/s3-upload-credentials")
@@ -487,9 +492,7 @@ def macos_release_build_with_debug_assertions(priority=None):
             "./etc/ci/lockfile_changed.sh",
             "tar -czf target.tar.gz" +
             " target/release/servo" +
-            " target/release/build/osmesa-src-*/output" +
-            " target/release/build/osmesa-src-*/out/src/gallium/targets/osmesa/.libs" +
-            " target/release/build/osmesa-src-*/out/src/mapi/shared-glapi/.libs",
+            " resources",
         ]))
         .with_artifacts("repo/target.tar.gz")
         .find_or_create("build.macos_x64_release_w_assertions." + CONFIG.tree_hash())
@@ -517,8 +520,7 @@ def linux_release_build_with_debug_assertions(layout_2020):
             ./etc/ci/lockfile_changed.sh
             tar -czf /target.tar.gz \
                 target/release/servo \
-                target/release/build/osmesa-src-*/output \
-                target/release/build/osmesa-src-*/out/lib/gallium
+                resources
             sccache --show-stats
         """ % build_args)
         .with_artifacts("/target.tar.gz")
@@ -568,12 +570,17 @@ def wpt_chunks(platform, make_chunk_task, build_task, total_chunks, processes,
         start = 1  # Skip the "extra" WPT testing, a.k.a. chunk 0
         name_prefix = "Layout 2020 "
         job_id_prefix = "2020-"
-        args = "--layout-2020"
+        args = ["--layout-2020"]
     else:
         start = 0
         name_prefix = ""
         job_id_prefix = ""
-        args = ""
+        args = []
+
+    # Our Mac CI runs on machines with an Intel 4000 GPU, so need to work around
+    # https://github.com/servo/webrender/wiki/Driver-issues#bug-1570736---texture-swizzling-affects-wrap-modes-on-some-intel-gpus
+    if platform == "macOS x64":
+        args += ["--pref gfx.texture-swizzling.enabled=false"]
 
     if chunks == "all":
         chunks = range(start, total_chunks + 1)
@@ -599,7 +606,7 @@ def wpt_chunks(platform, make_chunk_task, build_task, total_chunks, processes,
                 TOTAL_CHUNKS=str(total_chunks),
                 THIS_CHUNK=str(this_chunk),
                 PROCESSES=str(processes),
-                WPT_ARGS=args,
+                WPT_ARGS=" ".join(args),
                 GST_DEBUG="3",
             )
         )
@@ -608,18 +615,17 @@ def wpt_chunks(platform, make_chunk_task, build_task, total_chunks, processes,
         # https://github.com/servo/servo/issues/22438
         if this_chunk == 0:
             task.with_script("""
-                ./mach test-wpt-failure
-                time python2 ./mach test-wpt --release --binary-arg=--multiprocess \
+                time python ./mach test-wpt --release --binary-arg=--multiprocess \
                     --processes $PROCESSES \
                     --log-raw test-wpt-mp.log \
                     --log-errorsummary wpt-mp-errorsummary.log \
                     eventsource \
                     | cat
-                time env PYTHONIOENCODING=utf-8 python3 ./mach test-wpt --release --binary-arg=--multiprocess \
+                time env PYTHONIOENCODING=utf-8 python3 ./mach test-wpt --release \
                     --processes $PROCESSES \
-                    --log-raw test-wpt-mp.log \
-                    --log-errorsummary wpt-mp-errorsummary.log \
-                    eventsource \
+                    --log-raw test-wpt-py3.log \
+                    --log-errorsummary wpt-py3-errorsummary.log \
+                    url \
                     | cat
                 time ./mach test-wpt --release --product=servodriver --headless  \
                     tests/wpt/mozilla/tests/mozilla/DOMParser.html \
@@ -714,7 +720,6 @@ def windows_task(name):
 def macos_task(name):
     return (
         decisionlib.MacOsGenericWorkerTask(name)
-        .with_provisioner_id("proj-servo")
         .with_worker_type(CONFIG.macos_worker_type)
         .with_treeherder_required()
     )
@@ -742,7 +747,7 @@ def linux_build_task(name, *, build_env=build_env):
     return task
 
 
-def windows_build_task(name, package=True, arch="x86_64"):
+def windows_build_task(name, package=True, arch="x86_64", rdp=False):
     hashes = {
         "devel": {
             "x86_64": "c136cbfb0330041d52fe6ec4e3e468563176333c857f6ed71191ebc37fc9d605",
@@ -773,30 +778,27 @@ def windows_build_task(name, package=True, arch="x86_64"):
         .with_rustup()
     )
     if arch in hashes["non-devel"] and arch in hashes["devel"]:
-        task = (
-            task.with_repacked_msi(
-                url=("https://gstreamer.freedesktop.org/data/pkg/windows/" +
-                     "%s/gstreamer-1.0-%s-%s-%s.msi" % (version, prefix[arch], arch, version)),
-                sha256=hashes["non-devel"][arch],
-                path="gst",
-            )
-            .with_repacked_msi(
-                url=("https://gstreamer.freedesktop.org/data/pkg/windows/" +
-                     "%s/gstreamer-1.0-devel-%s-%s-%s.msi" % (version, prefix[arch], arch, version)),
-                sha256=hashes["devel"][arch],
-                path="gst",
-            )
+        task.with_repacked_msi(
+            url=("https://gstreamer.freedesktop.org/data/pkg/windows/" +
+                 "%s/gstreamer-1.0-%s-%s-%s.msi" % (version, prefix[arch], arch, version)),
+            sha256=hashes["non-devel"][arch],
+            path="gst",
+        )
+        task.with_repacked_msi(
+            url=("https://gstreamer.freedesktop.org/data/pkg/windows/" +
+                 "%s/gstreamer-1.0-devel-%s-%s-%s.msi" % (version, prefix[arch], arch, version)),
+            sha256=hashes["devel"][arch],
+            path="gst",
         )
     if package:
-        task = (
-            task
-            .with_directory_mount(
-                "https://github.com/wixtoolset/wix3/releases/download/wix3111rtm/wix311-binaries.zip",
-                sha256="37f0a533b0978a454efb5dc3bd3598becf9660aaf4287e55bf68ca6b527d051d",
-                path="wix",
-            )
-            .with_path_from_homedir("wix")
+        task.with_directory_mount(
+            "https://github.com/wixtoolset/wix3/releases/download/wix3111rtm/wix311-binaries.zip",
+            sha256="37f0a533b0978a454efb5dc3bd3598becf9660aaf4287e55bf68ca6b527d051d",
+            path="wix",
         )
+        task.with_path_from_homedir("wix")
+    if rdp:
+        task.with_rdp_info(artifact_name="project/servo/rdp-info")
     return task
 
 

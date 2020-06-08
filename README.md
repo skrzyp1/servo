@@ -74,7 +74,7 @@ If `./mach bootstrap` doesn't work, file a bug, and, run the commands below:
 ``` sh
 sudo apt install git curl autoconf libx11-dev libfreetype6-dev libgl1-mesa-dri \
     libglib2.0-dev xorg-dev gperf g++ build-essential cmake libssl-dev \
-    libbz2-dev liblzma-dev libosmesa6-dev libxmu6 libxmu-dev libglu1-mesa-dev \
+    liblzma-dev libxmu6 libxmu-dev \
     libgles2-mesa-dev libegl1-mesa-dev libdbus-1-dev libharfbuzz-dev ccache \
     clang libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
     libgstreamer-plugins-bad1.0-dev autoconf2.13 llvm-dev
@@ -86,54 +86,22 @@ If you are using **Ubuntu 16.04** or **Linux Mint 18.&#42;** run `export HARFBUZ
 
 If you get an undefined symbol error on `gst_player_get_config` try removing `gir1.2-gst-plugins-bad-1.0` and all old versions of clang, see [#22016](https://github.com/servo/servo/issues/22016)
 
-If you are on **Ubuntu 14.04** and encountered errors on installing these dependencies involving `libcheese`, see [#6158](https://github.com/servo/servo/issues/6158) for a workaround. You may also need to install gcc 4.9, clang 4.0, and cmake 3.2:
-
-<details>
-gcc 4.9:
-
-```sh
-sudo add-apt-repository ppa:ubuntu-toolchain-r/test
-sudo apt-get update
-sudo apt-get install gcc-4.9 g++-4.9
-sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-4.9 60 --slave /usr/bin/g++ g++ /usr/bin/g++-4.9
-```
-
-clang 4.0:
-
-```sh
-wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-sudo apt-add-repository "deb http://apt.llvm.org/trusty/ llvm-toolchain-trusty-4.0 main"
-sudo apt-get update
-sudo apt-get install -y clang-4.0
-```
-
-cmake 3.2:
-
-```sh
-sudo apt-get install software-properties-common
-sudo add-apt-repository ppa:george-edison55/cmake-3.x
-sudo apt-get update
-sudo apt-get install cmake
-```
-
-</details>
-
 #### On Fedora
 
 ``` sh
-sudo dnf install python2 python2-virtualenv python2-pip
-./mach bootstrap
+sudo dnf install python3 python3-virtualenv python3-pip python3-devel
+python3 ./mach bootstrap
 ```
 
-If `./mach bootstrap` doesn't work, file a bug, and, run the commands below:
+If `python3 ./mach bootstrap` doesn't work, file a bug, and, run the commands below:
 
 ``` sh
 sudo dnf install curl libtool gcc-c++ libXi-devel libunwind-devel \
     freetype-devel mesa-libGL-devel mesa-libEGL-devel glib2-devel libX11-devel \
     libXrandr-devel gperf fontconfig-devel cabextract ttmkfdir  expat-devel \
-    rpm-build openssl-devel cmake bzip2-devel libX11-devel libXcursor-devel \
-    libXmu-devel mesa-libOSMesa-devel dbus-devel ncurses-devel harfbuzz-devel \
-    ccache mesa-libGLU-devel clang clang-libs gstreamer1-devel \
+    rpm-build openssl-devel cmake libX11-devel libXcursor-devel \
+    libXmu-devel dbus-devel ncurses-devel harfbuzz-devel \
+    ccache clang clang-libs python3-devel gstreamer1-devel \
     gstreamer1-plugins-base-devel gstreamer1-plugins-bad-free-devel autoconf213
 ```
 
@@ -150,8 +118,8 @@ If `./mach bootstrap` doesn't work, file a bug, and, run the commands below:
 sudo yum install curl libtool gcc-c++ libXi-devel freetype-devel \
     mesa-libGL-devel mesa-libEGL-devel glib2-devel libX11-devel libXrandr-devel \
     gperf fontconfig-devel cabextract ttmkfdir python expat-devel rpm-build \
-    openssl-devel cmake3 bzip2-devel libXcursor-devel libXmu-devel \
-    mesa-libOSMesa-devel dbus-devel ncurses-devel python34 harfbuzz-devel \
+    openssl-devel cmake3 libXcursor-devel libXmu-devel \
+    dbus-devel ncurses-devel python34 harfbuzz-devel \
     ccache clang clang-libs llvm-toolset-7
 ```
 
@@ -171,17 +139,17 @@ export LIBCLANG_PATH=/opt/rh/llvm-toolset-7/root/usr/lib64
 #### On openSUSE Linux
 
 ``` sh
-sudo zypper install libX11-devel libexpat-devel libbz2-devel Mesa-libEGL-devel Mesa-libGL-devel cabextract cmake \
+sudo zypper install libX11-devel libexpat-devel Mesa-libEGL-devel Mesa-libGL-devel cabextract cmake \
     dbus-1-devel fontconfig-devel freetype-devel gcc-c++ git glib2-devel gperf \
-    harfbuzz-devel libOSMesa-devel libXcursor-devel libXi-devel libXmu-devel libXrandr-devel libopenssl-devel \
-    python-pip python-virtualenv rpm-build glu-devel ccache llvm-clang libclang autoconf213 gstreamer-devel \
+    harfbuzz-devel libXcursor-devel libXi-devel libXmu-devel libXrandr-devel libopenssl-devel \
+    python-pip python-virtualenv rpm-build ccache llvm-clang libclang autoconf213 gstreamer-devel \
     gstreamer-plugins-base-devel gstreamer-plugins-bad-devel
 ```
 
 #### On Arch Linux
 
 ``` sh
-sudo pacman -S --needed base-devel git python2 python2-virtualenv python2-pip mesa cmake bzip2 libxmu glu \
+sudo pacman -S --needed base-devel git python2 python2-virtualenv python2-pip mesa cmake libxmu \
     pkg-config ttf-fira-sans harfbuzz ccache llvm clang autoconf2.13 gstreamer gstreamer-vaapi
 ```
 
@@ -192,7 +160,7 @@ sudo emerge net-misc/curl \
     media-libs/freetype media-libs/mesa dev-util/gperf \
     dev-python/virtualenv dev-python/pip dev-libs/openssl \
     media-libs/harfbuzz dev-util/ccache sys-libs/libunwind \
-    x11-libs/libXmu media-libs/glu x11-base/xorg-server sys-devel/clang \
+    x11-libs/libXmu x11-base/xorg-server sys-devel/clang \
     media-libs/gstreamer media-libs/gst-plugins-bad media-libs/gst-plugins-base
 ```
 
@@ -285,6 +253,10 @@ linker = "lld-link.exe"
 > the `WindowsSdkDir` environment variable to an appropriate `Windows Kit` directory containing
 > `Redist\ucrt\DLLs\x64\api-ms-win-crt-runtime-l1-1-0.dll`, for example
 > `C:\Program Files (x86)\Windows Kits\10`.
+
+> If you get the error `thread 'main' panicked at 'Unable to find libclang: "couldn\'t find any valid shared libraries matching: [\'clang.dll\', \'libclang.dll\'], set the `LIBCLANG_PATH` environment variable to a path where one of these files can be found (invalid: ... invalid DLL (64-bit))])"'`
+> then `rustup` may have installed the 32-bit default target rather than the 64-bit one.
+> You can find the configuration with `rustup show`, and set the default with `rustup set default-host x86_64-pc-windows-msvc`.
 
 #### Cross-compilation for Android
 

@@ -6,6 +6,8 @@ use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorBinding::NavigatorMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowBinding::WindowMethods;
+use crate::dom::bindings::codegen::Bindings::XRHitTestSourceBinding::XRHitTestOptionsInit;
+use crate::dom::bindings::codegen::Bindings::XRHitTestSourceBinding::XRHitTestTrackableType;
 use crate::dom::bindings::codegen::Bindings::XRReferenceSpaceBinding::XRReferenceSpaceType;
 use crate::dom::bindings::codegen::Bindings::XRRenderStateBinding::XRRenderStateInit;
 use crate::dom::bindings::codegen::Bindings::XRRenderStateBinding::XRRenderStateMethods;
@@ -14,6 +16,9 @@ use crate::dom::bindings::codegen::Bindings::XRSessionBinding::XRFrameRequestCal
 use crate::dom::bindings::codegen::Bindings::XRSessionBinding::XRSessionMethods;
 use crate::dom::bindings::codegen::Bindings::XRSessionBinding::XRVisibilityState;
 use crate::dom::bindings::codegen::Bindings::XRSystemBinding::XRSessionMode;
+use crate::dom::bindings::codegen::Bindings::XRWebGLLayerBinding::{
+    XRWebGLLayerMethods, XRWebGLRenderingContext,
+};
 use crate::dom::bindings::error::{Error, ErrorResult};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
@@ -25,34 +30,35 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::performance::reduce_timing_resolution;
 use crate::dom::promise::Promise;
 use crate::dom::xrframe::XRFrame;
+use crate::dom::xrhittestsource::XRHitTestSource;
 use crate::dom::xrinputsourcearray::XRInputSourceArray;
 use crate::dom::xrinputsourceevent::XRInputSourceEvent;
 use crate::dom::xrreferencespace::XRReferenceSpace;
 use crate::dom::xrrenderstate::XRRenderState;
 use crate::dom::xrsessionevent::XRSessionEvent;
 use crate::dom::xrspace::XRSpace;
-use crate::dom::xrwebgllayer::XRWebGLLayer;
 use crate::realms::InRealm;
 use crate::task_source::TaskSource;
 use dom_struct::dom_struct;
-use euclid::{Rect, RigidTransform3D, Transform3D};
+use euclid::{RigidTransform3D, Transform3D, Vector3D};
 use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::router::ROUTER;
 use metrics::ToMs;
 use profile_traits::ipc;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::f64::consts::{FRAC_PI_2, PI};
 use std::mem;
 use std::rc::Rc;
 use webxr_api::{
-    self, util, Display, EnvironmentBlendMode, Event as XREvent, Frame, SelectEvent, SelectKind,
-    Session, SessionId, View, Viewer, Visibility,
+    self, util, ApiSpace, Display, EntityTypes, EnvironmentBlendMode, Event as XREvent, Frame,
+    FrameUpdateEvent, HitTestId, HitTestSource, Ray, SelectEvent, SelectKind, Session, SessionId,
+    View, Viewer, Visibility,
 };
 
 #[dom_struct]
 pub struct XRSession {
     eventtarget: EventTarget,
-    base_layer: MutNullableDom<XRWebGLLayer>,
     blend_mode: XREnvironmentBlendMode,
     mode: XRSessionMode,
     visibility_state: Cell<XRVisibilityState>,
@@ -68,12 +74,18 @@ pub struct XRSession {
     next_raf_id: Cell<i32>,
     #[ignore_malloc_size_of = "closures are hard"]
     raf_callback_list: DomRefCell<Vec<(i32, Option<Rc<XRFrameRequestCallback>>)>>,
+    #[ignore_malloc_size_of = "closures are hard"]
+    current_raf_callback_list: DomRefCell<Vec<(i32, Option<Rc<XRFrameRequestCallback>>)>>,
     input_sources: Dom<XRInputSourceArray>,
     // Any promises from calling end()
     #[ignore_malloc_size_of = "promises are hard"]
     end_promises: DomRefCell<Vec<Rc<Promise>>>,
     /// https://immersive-web.github.io/webxr/#ended
     ended: Cell<bool>,
+    #[ignore_malloc_size_of = "defined in webxr"]
+    next_hit_test_id: Cell<HitTestId>,
+    #[ignore_malloc_size_of = "defined in webxr"]
+    pending_hit_test_promises: DomRefCell<HashMap<HitTestId, Rc<Promise>>>,
     /// Opaque framebuffers need to know the session is "outside of a requestAnimationFrame"
     /// https://immersive-web.github.io/webxr/#opaque-framebuffer
     outside_raf: Cell<bool>,
@@ -88,7 +100,6 @@ impl XRSession {
     ) -> XRSession {
         XRSession {
             eventtarget: EventTarget::new_inherited(),
-            base_layer: Default::default(),
             blend_mode: session.environment_blend_mode().into(),
             mode,
             visibility_state: Cell::new(XRVisibilityState::Visible),
@@ -101,9 +112,12 @@ impl XRSession {
 
             next_raf_id: Cell::new(0),
             raf_callback_list: DomRefCell::new(vec![]),
+            current_raf_callback_list: DomRefCell::new(vec![]),
             input_sources: Dom::from_ref(input_sources),
             end_promises: DomRefCell::new(vec![]),
             ended: Cell::new(false),
+            next_hit_test_id: Cell::new(HitTestId(0)),
+            pending_hit_test_promises: DomRefCell::new(HashMap::new()),
             outside_raf: Cell::new(true),
         }
     }
@@ -119,7 +133,7 @@ impl XRSession {
         } else {
             None
         };
-        let render_state = XRRenderState::new(global, 0.1, 1000.0, ivfov, None);
+        let render_state = XRRenderState::new(global, 0.1, 1000.0, ivfov, None, &[]);
         let input_sources = XRInputSourceArray::new(global);
         let ret = reflect_dom_object(
             Box::new(XRSession::new_inherited(
@@ -322,6 +336,9 @@ impl XRSession {
                     self,
                 );
                 event.upcast::<Event>().fire(self.upcast());
+                // The page may be visible again, dirty the layers
+                // This also wakes up the event loop if necessary
+                self.dirty_layers();
             },
             XREvent::AddInput(info) => {
                 self.input_sources.add_input_sources(self, &[info]);
@@ -355,7 +372,14 @@ impl XRSession {
             // Step 6-7: XXXManishearth handle inlineVerticalFieldOfView
 
             if self.is_immersive() {
-                let swap_chain_id = pending.GetBaseLayer().map(|layer| layer.swap_chain_id());
+                let swap_chain_id = pending
+                    .GetBaseLayer()
+                    .map(|layer| layer.swap_chain_id())
+                    .or_else(|| {
+                        self.active_render_state.get().with_layers(|layers| {
+                            layers.get(0).and_then(|layer| layer.swap_chain_id())
+                        })
+                    });
                 self.session.borrow_mut().set_swap_chain(swap_chain_id);
             } else {
                 self.update_inline_projection_matrix()
@@ -363,19 +387,22 @@ impl XRSession {
         }
 
         for event in frame.events.drain(..) {
-            self.session.borrow_mut().apply_event(event)
+            self.handle_frame_update(event);
         }
 
         // Step 2
-        let base_layer = match self.active_render_state.get().GetBaseLayer() {
-            Some(layer) => layer,
-            None => return,
-        };
+        if !self.active_render_state.get().has_layer() {
+            return;
+        }
 
         // Step 3: XXXManishearth handle inline session
 
         // Step 4-5
-        let mut callbacks = mem::replace(&mut *self.raf_callback_list.borrow_mut(), vec![]);
+        {
+            let mut current = self.current_raf_callback_list.borrow_mut();
+            assert!(current.is_empty());
+            mem::swap(&mut *self.raf_callback_list.borrow_mut(), &mut current);
+        }
         let start = self.global().as_window().get_navigation_start();
         let time = reduce_timing_resolution((frame.time_ns - start).to_ms());
 
@@ -386,16 +413,30 @@ impl XRSession {
 
         // Step 8
         self.outside_raf.set(false);
-        for (_, callback) in callbacks.drain(..) {
+        let len = self.current_raf_callback_list.borrow().len();
+        for i in 0..len {
+            let callback = self.current_raf_callback_list.borrow()[i]
+                .1
+                .as_ref()
+                .map(|callback| Rc::clone(callback));
             if let Some(callback) = callback {
                 let _ = callback.Call__(time, &frame, ExceptionHandling::Report);
             }
         }
         self.outside_raf.set(true);
+        *self.current_raf_callback_list.borrow_mut() = vec![];
 
         frame.set_active(false);
         if self.is_immersive() {
-            base_layer.swap_buffers();
+            if let Some(base_layer) = self.active_render_state.get().GetBaseLayer() {
+                base_layer.swap_buffers();
+            } else {
+                self.active_render_state.get().with_layers(|layers| {
+                    for layer in layers {
+                        layer.swap_buffers();
+                    }
+                });
+            }
             self.session.borrow_mut().render_animation_frame();
         } else {
             self.session.borrow_mut().start_render_loop();
@@ -435,22 +476,42 @@ impl XRSession {
     /// Constructs a View suitable for inline sessions using the inlineVerticalFieldOfView and canvas size
     pub fn inline_view(&self) -> View<Viewer> {
         debug_assert!(!self.is_immersive());
-        let size = self
-            .active_render_state
-            .get()
-            .GetBaseLayer()
-            .expect("Must never construct views when base layer is not set")
-            .size();
         View {
             // Inline views have no offset
             transform: RigidTransform3D::identity(),
             projection: *self.inline_projection_matrix.borrow(),
-            viewport: Rect::from_size(size.to_i32()),
         }
     }
 
     pub fn session_id(&self) -> SessionId {
         self.session.borrow().id()
+    }
+
+    pub fn dirty_layers(&self) {
+        if let Some(layer) = self.RenderState().GetBaseLayer() {
+            match layer.Context() {
+                XRWebGLRenderingContext::WebGLRenderingContext(c) => c.mark_as_dirty(),
+                XRWebGLRenderingContext::WebGL2RenderingContext(c) => {
+                    c.base_context().mark_as_dirty()
+                },
+            }
+        }
+    }
+
+    fn handle_frame_update(&self, event: FrameUpdateEvent) {
+        match event {
+            FrameUpdateEvent::HitTestSourceAdded(id) => {
+                if let Some(promise) = self.pending_hit_test_promises.borrow_mut().remove(&id) {
+                    promise.resolve_native(&XRHitTestSource::new(&self.global(), id, &self));
+                } else {
+                    warn!(
+                        "received hit test add request for unknown hit test {:?}",
+                        id
+                    )
+                }
+            },
+            _ => self.session.borrow_mut().apply_event(event),
+        }
     }
 }
 
@@ -513,6 +574,23 @@ impl XRSessionMethods for XRSession {
             return Err(Error::InvalidState);
         }
 
+        // TODO: add spec link for this step once XR layers has settled down
+        // https://immersive-web.github.io/layers/
+        if init.baseLayer.is_some() && init.layers.is_some() {
+            return Err(Error::InvalidState);
+        }
+
+        // TODO: add spec link for this step once XR layers has settled down
+        // https://immersive-web.github.io/layers/
+        if init
+            .layers
+            .as_ref()
+            .map(|layers| layers.is_empty())
+            .unwrap_or(false)
+        {
+            return Err(Error::InvalidState);
+        }
+
         let pending = self
             .pending_render_state
             .or_init(|| self.active_render_state.get().clone_object());
@@ -546,7 +624,8 @@ impl XRSessionMethods for XRSession {
             pending.set_inline_vertical_fov(fov);
         }
         if let Some(ref layer) = init.baseLayer {
-            pending.set_layer(Some(&layer))
+            pending.set_layer(Some(&layer));
+            pending.set_layers(&[]);
         }
 
         if init.depthFar.is_some() || init.depthNear.is_some() {
@@ -554,6 +633,14 @@ impl XRSessionMethods for XRSession {
                 .borrow_mut()
                 .update_clip_planes(*pending.DepthNear() as f32, *pending.DepthFar() as f32);
         }
+
+        // TODO: add spec link for this step once XR layers has settled down
+        // https://immersive-web.github.io/layers/
+        if let Some(ref layers) = init.layers {
+            pending.set_layer(None);
+            pending.set_layers(layers);
+        }
+
         Ok(())
     }
 
@@ -572,6 +659,11 @@ impl XRSessionMethods for XRSession {
     /// https://immersive-web.github.io/webxr/#dom-xrsession-cancelanimationframe
     fn CancelAnimationFrame(&self, frame: i32) {
         let mut list = self.raf_callback_list.borrow_mut();
+        if let Some(pair) = list.iter_mut().find(|pair| pair.0 == frame) {
+            pair.1 = None;
+        }
+
+        let mut list = self.current_raf_callback_list.borrow_mut();
         if let Some(pair) = list.iter_mut().find(|pair| pair.0 == frame) {
             pair.1 = None;
         }
@@ -655,16 +747,75 @@ impl XRSessionMethods for XRSession {
         self.session.borrow_mut().end_session();
         p
     }
+
+    // https://immersive-web.github.io/hit-test/#dom-xrsession-requesthittestsource
+    fn RequestHitTestSource(&self, options: &XRHitTestOptionsInit) -> Rc<Promise> {
+        let p = Promise::new(&self.global());
+
+        if self
+            .session
+            .borrow()
+            .granted_features()
+            .iter()
+            .find(|f| &**f == "hit-test")
+            .is_none()
+        {
+            p.reject_error(Error::NotSupported);
+            return p;
+        }
+
+        let id = self.next_hit_test_id.get();
+        self.next_hit_test_id.set(HitTestId(id.0 + 1));
+
+        let space = options.space.space();
+        let ray = if let Some(ref ray) = options.offsetRay {
+            ray.ray()
+        } else {
+            Ray {
+                origin: Vector3D::new(0., 0., 0.),
+                direction: Vector3D::new(0., 0., -1.),
+            }
+        };
+
+        let mut types = EntityTypes::default();
+
+        if let Some(ref tys) = options.entityTypes {
+            for ty in tys {
+                match ty {
+                    XRHitTestTrackableType::Point => types.point = true,
+                    XRHitTestTrackableType::Plane => types.plane = true,
+                    XRHitTestTrackableType::Mesh => types.mesh = true,
+                }
+            }
+        } else {
+            types.plane = true;
+        }
+
+        let source = HitTestSource {
+            id,
+            space,
+            ray,
+            types,
+        };
+        self.pending_hit_test_promises
+            .borrow_mut()
+            .insert(id, p.clone());
+
+        self.session.borrow().request_hit_test(source);
+
+        p
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ApiSpace;
 // The pose of an object in native-space. Should never be exposed.
 pub type ApiPose = RigidTransform3D<f32, ApiSpace, webxr_api::Native>;
-// The pose of the viewer in some api-space.
-pub type ApiViewerPose = RigidTransform3D<f32, webxr_api::Viewer, ApiSpace>;
 // A transform between objects in some API-space
 pub type ApiRigidTransform = RigidTransform3D<f32, ApiSpace, ApiSpace>;
+
+#[derive(Clone, Copy)]
+pub struct BaseSpace;
+
+pub type BaseTransform = RigidTransform3D<f32, webxr_api::Native, BaseSpace>;
 
 #[allow(unsafe_code)]
 pub fn cast_transform<T, U, V, W>(

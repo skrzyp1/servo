@@ -4,7 +4,7 @@
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::conversions::{root_from_handleobject, ToJSValConvertible};
-use crate::dom::bindings::error::{throw_dom_exception, Error};
+use crate::dom::bindings::error::{throw_dom_exception, Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::proxyhandler::fill_property_descriptor;
 use crate::dom::bindings::reflector::{DomObject, Reflector};
@@ -52,7 +52,7 @@ use script_traits::{
     AuxiliaryBrowsingContextLoadInfo, HistoryEntryReplacement, LoadData, LoadOrigin,
 };
 use script_traits::{NewLayoutInfo, ScriptMsg};
-use servo_url::ServoUrl;
+use servo_url::{ImmutableOrigin, ServoUrl};
 use std::cell::Cell;
 use std::ptr;
 use style::attr::parse_integer;
@@ -108,6 +108,15 @@ pub struct WindowProxy {
 
     /// https://html.spec.whatwg.org/multipage/#delaying-load-events-mode
     delaying_load_events_mode: Cell<bool>,
+
+    /// The creator browsing context's base url.
+    creator_base_url: Option<ServoUrl>,
+
+    /// The creator browsing context's url.
+    creator_url: Option<ServoUrl>,
+
+    /// The creator browsing context's origin.
+    creator_origin: Option<ImmutableOrigin>,
 }
 
 impl WindowProxy {
@@ -118,6 +127,7 @@ impl WindowProxy {
         frame_element: Option<&Element>,
         parent: Option<&WindowProxy>,
         opener: Option<BrowsingContextId>,
+        creator: CreatorBrowsingContextInfo,
     ) -> WindowProxy {
         let name = frame_element.map_or(DOMString::new(), |e| {
             e.get_string_attribute(&local_name!("name"))
@@ -135,6 +145,9 @@ impl WindowProxy {
             parent: parent.map(Dom::from_ref),
             delaying_load_events_mode: Cell::new(false),
             opener,
+            creator_base_url: creator.base_url,
+            creator_url: creator.url,
+            creator_origin: creator.origin,
         }
     }
 
@@ -146,6 +159,7 @@ impl WindowProxy {
         frame_element: Option<&Element>,
         parent: Option<&WindowProxy>,
         opener: Option<BrowsingContextId>,
+        creator: CreatorBrowsingContextInfo,
     ) -> DomRoot<WindowProxy> {
         unsafe {
             let WindowProxyHandler(handler) = window.windowproxy_handler();
@@ -173,6 +187,7 @@ impl WindowProxy {
                 frame_element,
                 parent,
                 opener,
+                creator,
             ));
 
             // The window proxy owns the browsing context.
@@ -204,6 +219,7 @@ impl WindowProxy {
         top_level_browsing_context_id: TopLevelBrowsingContextId,
         parent: Option<&WindowProxy>,
         opener: Option<BrowsingContextId>,
+        creator: CreatorBrowsingContextInfo,
     ) -> DomRoot<WindowProxy> {
         unsafe {
             let handler = CreateWrapperProxyHandler(&XORIGIN_PROXY_HANDLER);
@@ -219,6 +235,7 @@ impl WindowProxy {
                 None,
                 parent,
                 opener,
+                creator,
             ));
 
             // Create a new dissimilar-origin window.
@@ -368,6 +385,33 @@ impl WindowProxy {
         self.is_closing.get()
     }
 
+    /// https://html.spec.whatwg.org/multipage/#creator-base-url
+    pub fn creator_base_url(&self) -> Option<ServoUrl> {
+        self.creator_base_url.clone()
+    }
+
+    pub fn has_creator_base_url(&self) -> bool {
+        self.creator_base_url.is_some()
+    }
+
+    /// https://html.spec.whatwg.org/multipage/#creator-url
+    pub fn creator_url(&self) -> Option<ServoUrl> {
+        self.creator_url.clone()
+    }
+
+    pub fn has_creator_url(&self) -> bool {
+        self.creator_base_url.is_some()
+    }
+
+    /// https://html.spec.whatwg.org/multipage/#creator-origin
+    pub fn creator_origin(&self) -> Option<ImmutableOrigin> {
+        self.creator_origin.clone()
+    }
+
+    pub fn has_creator_origin(&self) -> bool {
+        self.creator_origin.is_some()
+    }
+
     #[allow(unsafe_code)]
     // https://html.spec.whatwg.org/multipage/#dom-opener
     pub fn opener(&self, cx: *mut JSContext, in_realm_proof: InRealm) -> JSVal {
@@ -378,6 +422,7 @@ impl WindowProxy {
             Some(opener_browsing_context_id) => opener_browsing_context_id,
             None => return NullValue(),
         };
+        let parent_browsing_context = self.parent.as_deref();
         let opener_proxy = match ScriptThread::find_window_proxy(opener_id) {
             Some(window_proxy) => window_proxy,
             None => {
@@ -389,12 +434,15 @@ impl WindowProxy {
                     Some(opener_top_id) => {
                         let global_to_clone_from =
                             unsafe { GlobalScope::from_context(cx, in_realm_proof) };
+                        let creator =
+                            CreatorBrowsingContextInfo::from(parent_browsing_context, None);
                         WindowProxy::new_dissimilar_origin(
                             &*global_to_clone_from,
                             opener_id,
                             opener_top_id,
                             None,
                             None,
+                            creator,
                         )
                     },
                     None => return NullValue(),
@@ -415,7 +463,7 @@ impl WindowProxy {
         url: USVString,
         target: DOMString,
         features: DOMString,
-    ) -> Option<DomRoot<WindowProxy>> {
+    ) -> Fallible<Option<DomRoot<WindowProxy>>> {
         // Step 4.
         let non_empty_target = match target.as_ref() {
             "" => DOMString::from("_blank"),
@@ -433,12 +481,12 @@ impl WindowProxy {
         // Step 10, 11
         let (chosen, new) = match self.choose_browsing_context(non_empty_target, noopener) {
             (Some(chosen), new) => (chosen, new),
-            (None, _) => return None,
+            (None, _) => return Ok(None),
         };
         // TODO Step 12, set up browsing context features.
         let target_document = match chosen.document() {
             Some(target_document) => target_document,
-            None => return None,
+            None => return Ok(None),
         };
         let target_window = target_document.window();
         // Step 13, and 14.4, will have happened elsewhere,
@@ -452,7 +500,7 @@ impl WindowProxy {
             // Step 14.1
             let url = match existing_document.url().join(&url) {
                 Ok(url) => url,
-                Err(_) => return None, // TODO: throw a  "SyntaxError" DOMException.
+                Err(_) => return Err(Error::Syntax),
             };
             // Step 14.3
             let referrer = if noreferrer {
@@ -479,10 +527,10 @@ impl WindowProxy {
         }
         if noopener {
             // Step 15 (Dis-owning has been done in create_auxiliary_browsing_context).
-            return None;
+            return Ok(None);
         }
         // Step 17.
-        return target_document.browsing_context();
+        return Ok(target_document.browsing_context());
     }
 
     // https://html.spec.whatwg.org/multipage/#the-rules-for-choosing-a-browsing-context-given-a-browsing-context-name
@@ -652,6 +700,54 @@ impl WindowProxy {
 
     pub fn set_name(&self, name: DOMString) {
         *self.name.borrow_mut() = name;
+    }
+}
+
+/// A browsing context can have a creator browsing context, the browsing context that
+/// was responsible for its creation. If a browsing context has a parent browsing context,
+/// then that is its creator browsing context. Otherwise, if the browsing context has an
+/// opener browsing context, then that is its creator browsing context. Otherwise, the
+/// browsing context has no creator browsing context.
+///
+/// If a browsing context A has a creator browsing context, then the Document that was the
+/// active document of that creator browsing context at the time A was created is the creator
+/// Document.
+///
+/// See: https://html.spec.whatwg.org/multipage/#creating-browsing-contexts
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CreatorBrowsingContextInfo {
+    /// Creator document URL.
+    url: Option<ServoUrl>,
+
+    /// Creator document base URL.
+    base_url: Option<ServoUrl>,
+
+    /// Creator document origin.
+    origin: Option<ImmutableOrigin>,
+}
+
+impl CreatorBrowsingContextInfo {
+    pub fn from(
+        parent: Option<&WindowProxy>,
+        opener: Option<&WindowProxy>,
+    ) -> CreatorBrowsingContextInfo {
+        let creator = match (parent, opener) {
+            (Some(parent), _) => parent.document(),
+            (None, Some(opener)) => opener.document(),
+            (None, None) => None,
+        };
+
+        let base_url = creator.as_deref().map(|document| document.base_url());
+        let url = creator.as_deref().map(|document| document.url());
+        let origin = creator
+            .as_deref()
+            .map(|document| document.origin().immutable().clone());
+
+        CreatorBrowsingContextInfo {
+            base_url,
+            url,
+            origin,
+        }
     }
 }
 

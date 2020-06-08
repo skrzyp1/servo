@@ -18,7 +18,7 @@ use crate::dom::canvasrenderingcontext2d::{
     CanvasRenderingContext2D, LayoutCanvasRenderingContext2DHelpers,
 };
 use crate::dom::document::Document;
-use crate::dom::element::{AttributeMutation, Element, RawLayoutElementHelpers};
+use crate::dom::element::{AttributeMutation, Element, LayoutElementHelpers};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::{window_from_node, Node};
@@ -27,7 +27,6 @@ use crate::dom::webgl2renderingcontext::WebGL2RenderingContext;
 use crate::dom::webglrenderingcontext::{
     LayoutCanvasWebGLRenderingContextHelpers, WebGLRenderingContext,
 };
-use crate::euclidext::Size2DExt;
 use crate::script_runtime::JSContext;
 use base64;
 use canvas_traits::canvas::{CanvasId, CanvasMsg, FromScriptMsg};
@@ -42,7 +41,6 @@ use js::error::throw_type_error;
 use js::rust::HandleValue;
 use profile_traits::ipc;
 use script_layout_interface::{HTMLCanvasData, HTMLCanvasDataSource};
-use servo_config::pref;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto};
 
 const DEFAULT_WIDTH: u32 = 300;
@@ -114,18 +112,17 @@ impl HTMLCanvasElement {
 }
 
 pub trait LayoutHTMLCanvasElementHelpers {
-    fn data(&self) -> HTMLCanvasData;
-    fn get_width(&self) -> LengthOrPercentageOrAuto;
-    fn get_height(&self) -> LengthOrPercentageOrAuto;
-    fn get_canvas_id_for_layout(&self) -> CanvasId;
+    fn data(self) -> HTMLCanvasData;
+    fn get_width(self) -> LengthOrPercentageOrAuto;
+    fn get_height(self) -> LengthOrPercentageOrAuto;
+    fn get_canvas_id_for_layout(self) -> CanvasId;
 }
 
-impl LayoutHTMLCanvasElementHelpers for LayoutDom<HTMLCanvasElement> {
+impl LayoutHTMLCanvasElementHelpers for LayoutDom<'_, HTMLCanvasElement> {
     #[allow(unsafe_code)]
-    fn data(&self) -> HTMLCanvasData {
-        unsafe {
-            let canvas = &*self.unsafe_get();
-            let source = match canvas.context.borrow_for_layout().as_ref() {
+    fn data(self) -> HTMLCanvasData {
+        let source = unsafe {
+            match self.unsafe_get().context.borrow_for_layout().as_ref() {
                 Some(&CanvasContext::Context2d(ref context)) => {
                     HTMLCanvasDataSource::Image(Some(context.to_layout().get_ipc_renderer()))
                 },
@@ -136,45 +133,39 @@ impl LayoutHTMLCanvasElementHelpers for LayoutDom<HTMLCanvasElement> {
                     context.to_layout().canvas_data_source()
                 },
                 None => HTMLCanvasDataSource::Image(None),
-            };
-
-            let width_attr = canvas
-                .upcast::<Element>()
-                .get_attr_for_layout(&ns!(), &local_name!("width"));
-            let height_attr = canvas
-                .upcast::<Element>()
-                .get_attr_for_layout(&ns!(), &local_name!("height"));
-            HTMLCanvasData {
-                source: source,
-                width: width_attr.map_or(DEFAULT_WIDTH, |val| val.as_uint()),
-                height: height_attr.map_or(DEFAULT_HEIGHT, |val| val.as_uint()),
-                canvas_id: self.get_canvas_id_for_layout(),
             }
+        };
+
+        let width_attr = self
+            .upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("width"));
+        let height_attr = self
+            .upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("height"));
+        HTMLCanvasData {
+            source: source,
+            width: width_attr.map_or(DEFAULT_WIDTH, |val| val.as_uint()),
+            height: height_attr.map_or(DEFAULT_HEIGHT, |val| val.as_uint()),
+            canvas_id: self.get_canvas_id_for_layout(),
         }
     }
 
-    #[allow(unsafe_code)]
-    fn get_width(&self) -> LengthOrPercentageOrAuto {
-        unsafe {
-            (&*self.upcast::<Element>().unsafe_get())
-                .get_attr_for_layout(&ns!(), &local_name!("width"))
-                .map(AttrValue::as_uint_px_dimension)
-                .unwrap_or(LengthOrPercentageOrAuto::Auto)
-        }
+    fn get_width(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("width"))
+            .map(AttrValue::as_uint_px_dimension)
+            .unwrap_or(LengthOrPercentageOrAuto::Auto)
+    }
+
+    fn get_height(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("height"))
+            .map(AttrValue::as_uint_px_dimension)
+            .unwrap_or(LengthOrPercentageOrAuto::Auto)
     }
 
     #[allow(unsafe_code)]
-    fn get_height(&self) -> LengthOrPercentageOrAuto {
-        unsafe {
-            (&*self.upcast::<Element>().unsafe_get())
-                .get_attr_for_layout(&ns!(), &local_name!("height"))
-                .map(AttrValue::as_uint_px_dimension)
-                .unwrap_or(LengthOrPercentageOrAuto::Auto)
-        }
-    }
-
-    #[allow(unsafe_code)]
-    fn get_canvas_id_for_layout(&self) -> CanvasId {
+    fn get_canvas_id_for_layout(self) -> CanvasId {
         unsafe {
             let canvas = &*self.unsafe_get();
             if let &Some(CanvasContext::Context2d(ref context)) = canvas.context.borrow_for_layout()
@@ -230,7 +221,8 @@ impl HTMLCanvasElement {
         cx: JSContext,
         options: HandleValue,
     ) -> Option<DomRoot<WebGL2RenderingContext>> {
-        if !pref!(dom.webgl2.enabled) {
+        if !WebGL2RenderingContext::is_webgl2_enabled(cx, self.global().reflector().get_jsobject())
+        {
             return None;
         }
         if let Some(ctx) = self.context() {
@@ -387,14 +379,14 @@ impl HTMLCanvasElementMethods for HTMLCanvasElement {
 
         // FIXME: Only handle image/png for now.
         let mut png = Vec::new();
-        // FIXME(nox): https://github.com/PistonDevelopers/image-png/issues/86
-        // FIXME(nox): https://github.com/PistonDevelopers/image-png/issues/87
+        // FIXME(nox): https://github.com/image-rs/image-png/issues/86
+        // FIXME(nox): https://github.com/image-rs/image-png/issues/87
         PNGEncoder::new(&mut png)
             .encode(&file, self.Width(), self.Height(), ColorType::Rgba8)
             .unwrap();
         let mut url = "data:image/png;base64,".to_owned();
         // FIXME(nox): Should this use base64::URL_SAFE?
-        // FIXME(nox): https://github.com/alicemaz/rust-base64/pull/56
+        // FIXME(nox): https://github.com/marshallpierce/rust-base64/pull/56
         base64::encode_config_buf(&png, base64::STANDARD, &mut url);
         Ok(USVString(url))
     }
@@ -440,8 +432,7 @@ impl<'a> From<&'a WebGLContextAttributes> for GLContextAttributes {
 
 pub mod utils {
     use crate::dom::window::Window;
-    use net_traits::image_cache::CanRequestImages;
-    use net_traits::image_cache::{ImageOrMetadataAvailable, ImageResponse, UsePlaceholder};
+    use net_traits::image_cache::ImageResponse;
     use net_traits::request::CorsSettings;
     use servo_url::ServoUrl;
 
@@ -451,18 +442,15 @@ pub mod utils {
         cors_setting: Option<CorsSettings>,
     ) -> ImageResponse {
         let image_cache = window.image_cache();
-        let response = image_cache.find_image_or_metadata(
-            url.into(),
+        let result = image_cache.get_image(
+            url.clone(),
             window.origin().immutable().clone(),
             cors_setting,
-            UsePlaceholder::No,
-            CanRequestImages::No,
         );
-        match response {
-            Ok(ImageOrMetadataAvailable::ImageAvailable(image, url)) => {
-                ImageResponse::Loaded(image, url)
-            },
-            _ => ImageResponse::None,
+
+        match result {
+            Some(image) => ImageResponse::Loaded(image, url),
+            None => ImageResponse::None,
         }
     }
 }

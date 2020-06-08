@@ -102,6 +102,7 @@ WEBIDL_STANDARDS = [
     b"//webaudio.github.io",
     b"//immersive-web.github.io/",
     b"//github.com/immersive-web/webxr-test-api/",
+    b"//github.com/immersive-web/webxr-hands-input/",
     b"//gpuweb.github.io",
     # Not a URL
     b"// This interface is entirely internal to Servo, and should not be" +
@@ -351,8 +352,10 @@ def check_lock(file_name, contents):
     def find_reverse_dependencies(name, content):
         for package in itertools.chain([content.get("root", {})], content["package"]):
             for dependency in package.get("dependencies", []):
-                if dependency.startswith("{} ".format(name)):
-                    yield package["name"], dependency
+                parts = dependency.split()
+                dependency = (parts[0], parts[1] if len(parts) > 1 else None, parts[2] if len(parts) > 2 else None)
+                if dependency[0] == name:
+                    yield package["name"], package["version"], dependency
 
     if not file_name.endswith(".lock"):
         raise StopIteration
@@ -393,9 +396,9 @@ def check_lock(file_name, contents):
             short_source = source.split("#")[0].replace("git+", "")
             message += "\n\t\033[93mThe following packages depend on version {} from '{}':\033[0m" \
                        .format(version, short_source)
-            for name, dependency in packages_dependencies:
-                if version in dependency and short_source in dependency:
-                    message += "\n\t\t" + name
+            for pname, package_version, dependency in packages_dependencies:
+                if version in dependency[1] and (not dependency[2] or short_source in dependency[2]):
+                    message += "\n\t\t" + pname + " " + package_version
         yield (1, message)
 
     # Check to see if we are transitively using any blocked packages
@@ -625,9 +628,6 @@ def check_rust(file_name, lines):
             (r": &Root<", "use &T instead of &Root<T>", no_filter),
             (r": &DomRoot<", "use &T instead of &DomRoot<T>", no_filter),
             (r"^&&", "operators should go at the end of the first line", no_filter),
-            # This particular pattern is not reentrant-safe in script_thread.rs
-            (r"match self.documents.borrow", "use a separate variable for the match expression",
-             lambda match, line: file_name.endswith('script_thread.rs')),
             # -> () is unnecessary
             (r"-> \(\)", "encountered function signature with -> ()", no_filter),
         ]

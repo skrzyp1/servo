@@ -12,7 +12,7 @@ use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::webglactiveinfo::WebGLActiveInfo;
 use crate::dom::webglobject::WebGLObject;
-use crate::dom::webglrenderingcontext::WebGLRenderingContext;
+use crate::dom::webglrenderingcontext::{Operation, WebGLRenderingContext};
 use crate::dom::webglshader::WebGLShader;
 use crate::dom::webgluniformlocation::WebGLUniformLocation;
 use canvas_traits::webgl::{webgl_channel, WebGLProgramId, WebGLResult};
@@ -84,17 +84,16 @@ impl WebGLProgram {
     }
 
     /// glDeleteProgram
-    pub fn mark_for_deletion(&self, fallible: bool) {
+    pub fn mark_for_deletion(&self, operation_fallibility: Operation) {
         if self.marked_for_deletion.get() {
             return;
         }
         self.marked_for_deletion.set(true);
         let cmd = WebGLCommand::DeleteProgram(self.id);
         let context = self.upcast::<WebGLObject>().context();
-        if fallible {
-            context.send_command_ignored(cmd);
-        } else {
-            context.send_command(cmd);
+        match operation_fallibility {
+            Operation::Fallible => context.send_command_ignored(cmd),
+            Operation::Infallible => context.send_command(cmd),
         }
         if self.is_deleted() {
             self.detach_shaders();
@@ -556,7 +555,7 @@ impl WebGLProgram {
             return Err(WebGLError::InvalidOperation);
         }
 
-        if block_index as usize >= self.active_uniforms.borrow().len() {
+        if block_index as usize >= self.active_uniform_blocks.borrow().len() {
             return Err(WebGLError::InvalidValue);
         }
 
@@ -570,6 +569,11 @@ impl WebGLProgram {
     pub fn bind_uniform_block(&self, block_index: u32, block_binding: u32) -> WebGLResult<()> {
         if block_index as usize >= self.active_uniform_blocks.borrow().len() {
             return Err(WebGLError::InvalidValue);
+        }
+
+        let mut active_uniforms = self.active_uniforms.borrow_mut();
+        if active_uniforms.len() > block_binding as usize {
+            active_uniforms[block_binding as usize].bind_index = Some(block_binding);
         }
 
         self.upcast::<WebGLObject>()
@@ -634,7 +638,7 @@ impl WebGLProgram {
 impl Drop for WebGLProgram {
     fn drop(&mut self) {
         self.in_use(false);
-        self.mark_for_deletion(true);
+        self.mark_for_deletion(Operation::Fallible);
     }
 }
 

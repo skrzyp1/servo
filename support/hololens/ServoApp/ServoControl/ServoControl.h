@@ -4,6 +4,8 @@
 #include "Servo.h"
 #include "DefaultUrl.h"
 
+using namespace winrt::Windows::Foundation::Collections;
+
 namespace winrt::ServoApp::implementation {
 struct ServoControl : ServoControlT<ServoControl>, public servo::ServoDelegate {
 
@@ -42,6 +44,14 @@ struct ServoControl : ServoControlT<ServoControl>, public servo::ServoDelegate {
   };
   void OnHistoryChanged(winrt::event_token const &token) noexcept {
     mOnHistoryChangedEvent.remove(token);
+  }
+
+  winrt::event_token
+  OnDevtoolsStatusChanged(DevtoolsStatusChangedDelegate const &handler) {
+    return mOnDevtoolsStatusChangedEvent.add(handler);
+  };
+  void OnDevtoolsStatusChanged(winrt::event_token const &token) noexcept {
+    mOnDevtoolsStatusChangedEvent.remove(token);
   }
 
   winrt::event_token OnLoadStarted(EventDelegate const &handler) {
@@ -100,8 +110,6 @@ struct ServoControl : ServoControlT<ServoControl>, public servo::ServoDelegate {
   virtual void OnServoShutdownComplete();
   virtual void OnServoTitleChanged(winrt::hstring);
   virtual void OnServoURLChanged(winrt::hstring);
-  virtual void Flush();
-  virtual void MakeCurrent();
   virtual bool OnServoAllowNavigation(winrt::hstring);
   virtual void OnServoAnimatingChanged(bool);
   virtual void OnServoIMEStateChanged(bool);
@@ -109,17 +117,22 @@ struct ServoControl : ServoControlT<ServoControl>, public servo::ServoDelegate {
                                            winrt::hstring);
   virtual void OnServoMediaSessionPlaybackStateChange(int);
   virtual void OnServoPromptAlert(winrt::hstring, bool);
+  virtual void OnServoShowContextMenu(std::optional<winrt::hstring>,
+                                      std::vector<winrt::hstring>);
   virtual servo::Servo::PromptResult OnServoPromptOkCancel(winrt::hstring,
                                                            bool);
   virtual servo::Servo::PromptResult OnServoPromptYesNo(winrt::hstring, bool);
   virtual std::optional<hstring> OnServoPromptInput(winrt::hstring,
                                                     winrt::hstring, bool);
-  virtual void OnServoDevtoolsStarted(bool success, const unsigned int port);
+  virtual void OnServoDevtoolsStarted(bool, const unsigned int);
+
+  DevtoolsStatus GetDevtoolsStatus();
 
 private:
   winrt::event<Windows::Foundation::EventHandler<hstring>> mOnURLChangedEvent;
   winrt::event<Windows::Foundation::EventHandler<hstring>> mOnTitleChangedEvent;
   winrt::event<HistoryChangedDelegate> mOnHistoryChangedEvent;
+  winrt::event<DevtoolsStatusChangedDelegate> mOnDevtoolsStatusChangedEvent;
   winrt::event<EventDelegate> mOnLoadStartedEvent;
   winrt::event<EventDelegate> mOnLoadEndedEvent;
   winrt::event<EventDelegate> mOnCaptureGesturesStartedEvent;
@@ -137,14 +150,16 @@ private:
              std::optional<hstring> secondaryButton,
              std::optional<hstring> input);
 
+  int mPanelHeight = 0;
+  int mPanelWidth = 0;
   float mDPI = 1;
   hstring mInitialURL = DEFAULT_URL;
   hstring mCurrentUrl = L"";
   bool mTransient = false;
 
   Windows::UI::Xaml::Controls::SwapChainPanel ServoControl::Panel();
-  void CreateRenderSurface();
-  void DestroyRenderSurface();
+  void CreateNativeWindow();
+  EGLNativeWindowType GetNativeWindow();
   void RecoverFromLostDevice();
 
   void StartRenderLoop();
@@ -191,7 +206,7 @@ private:
   void TryLoadUri(hstring);
 
   std::unique_ptr<servo::Servo> mServo;
-  EGLSurface mRenderSurface{EGL_NO_SURFACE};
+  PropertySet mNativeWindowProperties;
   OpenGLES mOpenGLES;
   bool mAnimating = false;
   bool mLooping = false;

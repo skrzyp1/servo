@@ -46,13 +46,15 @@ use js::jsapi::{
     CompileModule, ExceptionStackBehavior, GetModuleResolveHook, JSRuntime, SetModuleResolveHook,
 };
 use js::jsapi::{GetRequestedModules, SetModuleMetadataHook};
-use js::jsapi::{GetWaitForAllPromise, ModuleEvaluate, ModuleInstantiate, SourceText};
+use js::jsapi::{GetWaitForAllPromise, ModuleEvaluate, ModuleInstantiate};
 use js::jsapi::{Heap, JSContext, JS_ClearPendingException, SetModulePrivate};
 use js::jsapi::{JSAutoRealm, JSObject, JSString};
+use js::jsapi::{JS_DefineProperty4, JS_NewStringCopyN, JSPROP_ENUMERATE};
 use js::jsapi::{SetModuleDynamicImportHook, SetScriptPrivateReferenceHooks};
 use js::jsval::{JSVal, PrivateValue, UndefinedValue};
 use js::rust::jsapi_wrapped::{GetRequestedModuleSpecifier, JS_GetPendingException};
 use js::rust::jsapi_wrapped::{JS_GetArrayLength, JS_GetElement};
+use js::rust::transform_u16_to_source_text;
 use js::rust::wrappers::JS_SetPendingException;
 use js::rust::CompileOptionsWrapper;
 use js::rust::IntoHandle;
@@ -68,22 +70,12 @@ use servo_url::ServoUrl;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ffi;
-use std::marker::PhantomData;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use url::ParseError as UrlParseError;
 
 use indexmap::IndexSet;
-
-pub fn get_source_text(source: &[u16]) -> SourceText<u16> {
-    SourceText {
-        units_: source.as_ptr() as *const _,
-        length_: source.len() as u32,
-        ownsUnits_: false,
-        _phantom_0: PhantomData,
-    }
-}
 
 #[allow(unsafe_code)]
 unsafe fn gen_type_error(global: &GlobalScope, string: String) -> ModuleError {
@@ -329,13 +321,13 @@ impl ModuleTree {
             ))),
         );
 
-        let _realm = enter_realm(&*owner.global());
-        AlreadyInRealm::assert(&*owner.global());
-        let _ais = AutoIncumbentScript::new(&*owner.global());
+        let global = owner.global();
+        let realm = enter_realm(&*global);
+        let comp = InRealm::Entered(&realm);
 
         let promise = promise.as_ref().unwrap();
 
-        promise.append_native_handler(&handler);
+        promise.append_native_handler(&handler, comp);
     }
 }
 
@@ -368,13 +360,11 @@ impl ModuleTree {
         let compile_options =
             unsafe { CompileOptionsWrapper::new(*global.get_cx(), url_cstr.as_ptr(), 1) };
 
-        let mut source = get_source_text(&module);
-
         unsafe {
             rooted!(in(*global.get_cx()) let mut module_script = CompileModule(
                 *global.get_cx(),
                 compile_options.ptr,
-                &mut source,
+                &mut transform_u16_to_source_text(&module),
             ));
 
             if module_script.is_null() {
@@ -685,7 +675,7 @@ impl ModuleHandler {
 }
 
 impl Callback for ModuleHandler {
-    fn callback(&self, _cx: *mut JSContext, _v: HandleValue) {
+    fn callback(&self, _cx: SafeJSContext, _v: HandleValue, _realm: InRealm) {
         let task = self.task.borrow_mut().take().unwrap();
         task.run_box();
     }
@@ -733,13 +723,13 @@ impl ModuleOwner {
             ))),
         );
 
-        let realm = enter_realm(&*self.global());
+        let global = self.global();
+        let realm = enter_realm(&*global);
         let comp = InRealm::Entered(&realm);
-        let _ais = AutoIncumbentScript::new(&*self.global());
 
         let promise = Promise::new_in_current_realm(&self.global(), comp);
 
-        promise.append_native_handler(&handler);
+        promise.append_native_handler(&handler, comp);
 
         promise
     }
@@ -1074,7 +1064,7 @@ pub unsafe fn EnsureModuleHooksInitialized(rt: *mut JSRuntime) {
     }
 
     SetModuleResolveHook(rt, Some(HostResolveImportedModule));
-    SetModuleMetadataHook(rt, None);
+    SetModuleMetadataHook(rt, Some(HostPopulateImportMeta));
     SetScriptPrivateReferenceHooks(rt, None, None);
 
     SetModuleDynamicImportHook(rt, None);
@@ -1127,6 +1117,39 @@ unsafe extern "C" fn HostResolveImportedModule(
     }
 
     unreachable!()
+}
+
+#[allow(unsafe_code, non_snake_case)]
+/// https://tc39.es/ecma262/#sec-hostgetimportmetaproperties
+/// https://html.spec.whatwg.org/multipage/#hostgetimportmetaproperties
+unsafe extern "C" fn HostPopulateImportMeta(
+    cx: *mut JSContext,
+    reference_private: RawHandleValue,
+    meta_object: RawHandle<*mut JSObject>,
+) -> bool {
+    let in_realm_proof = AlreadyInRealm::assert_for_cx(SafeJSContext::from_ptr(cx));
+    let global_scope = GlobalScope::from_context(cx, InRealm::Already(&in_realm_proof));
+
+    // Step 2.
+    let base_url = match (reference_private.to_private() as *const ModuleScript).as_ref() {
+        Some(module_data) => module_data.base_url.clone(),
+        None => global_scope.api_base_url(),
+    };
+
+    rooted!(in(cx) let url_string = JS_NewStringCopyN(
+        cx,
+        base_url.as_str().as_ptr() as *const i8,
+        base_url.as_str().len()
+    ));
+
+    // Step 3.
+    JS_DefineProperty4(
+        cx,
+        meta_object,
+        "url\0".as_ptr() as *const i8,
+        url_string.handle().into_handle(),
+        JSPROP_ENUMERATE.into(),
+    )
 }
 
 /// https://html.spec.whatwg.org/multipage/#fetch-a-module-script-tree
@@ -1339,8 +1362,7 @@ fn fetch_module_descendants_and_link(
                 unsafe {
                     let global = owner.global();
 
-                    let _realm = enter_realm(&*global);
-                    AlreadyInRealm::assert(&*global);
+                    let realm = enter_realm(&*global);
                     let _ais = AutoIncumbentScript::new(&*global);
 
                     let abv = RootedObjectVectorWrapper::new(*global.get_cx());
@@ -1379,7 +1401,8 @@ fn fetch_module_descendants_and_link(
                         ))),
                     );
 
-                    promise_all.append_native_handler(&handler);
+                    let comp = InRealm::Entered(&realm);
+                    promise_all.append_native_handler(&handler, comp);
 
                     return Some(promise_all);
                 }

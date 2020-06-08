@@ -63,12 +63,17 @@ where
     /// out references which cannot outlive this new `Root`.
     #[allow(unrooted_must_root)]
     pub unsafe fn new(value: T) -> Self {
-        debug_assert!(thread_state::get().is_script());
-        STACK_ROOTS.with(|ref root_list| {
-            let root_list = &*root_list.get().unwrap();
-            root_list.root(value.stable_trace_object());
-            Root { value, root_list }
-        })
+        unsafe fn add_to_root_list(object: *const dyn JSTraceable) -> *const RootCollection {
+            assert_in_script();
+            STACK_ROOTS.with(|ref root_list| {
+                let root_list = &*root_list.get().unwrap();
+                root_list.root(object);
+                root_list
+            })
+        }
+
+        let root_list = add_to_root_list(value.stable_trace_object());
+        Root { value, root_list }
     }
 }
 
@@ -132,7 +137,7 @@ where
     type Target = <T as Deref>::Target;
 
     fn deref(&self) -> &Self::Target {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         &self.value
     }
 }
@@ -246,7 +251,7 @@ impl<'a> Drop for ThreadLocalStackRoots<'a> {
 impl RootCollection {
     /// Create an empty collection of roots
     pub fn new() -> RootCollection {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         RootCollection {
             roots: UnsafeCell::new(vec![]),
         }
@@ -254,13 +259,13 @@ impl RootCollection {
 
     /// Starts tracking a trace object.
     unsafe fn root(&self, object: *const dyn JSTraceable) {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         (*self.roots.get()).push(object);
     }
 
     /// Stops tracking a trace object, asserting if it isn't found.
     unsafe fn unroot(&self, object: *const dyn JSTraceable) {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         let roots = &mut *self.roots.get();
         match roots
             .iter()
@@ -328,9 +333,9 @@ impl<T> MallocSizeOf for Dom<T> {
 impl<T> Dom<T> {
     /// Returns `LayoutDom<T>` containing the same pointer.
     pub unsafe fn to_layout(&self) -> LayoutDom<T> {
-        debug_assert!(thread_state::get().is_layout());
+        assert_in_layout();
         LayoutDom {
-            ptr: self.ptr.clone(),
+            value: self.ptr.as_ref(),
         }
     }
 }
@@ -339,7 +344,7 @@ impl<T: DomObject> Dom<T> {
     /// Create a Dom<T> from a &T
     #[allow(unrooted_must_root)]
     pub fn from_ref(obj: &T) -> Dom<T> {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         Dom {
             ptr: ptr::NonNull::from(obj),
         }
@@ -350,7 +355,7 @@ impl<T: DomObject> Deref for Dom<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         // We can only have &Dom<T> from a rooted thing, so it's safe to deref
         // it to &T.
         unsafe { &*self.ptr.as_ptr() }
@@ -383,7 +388,7 @@ where
     #[allow(unrooted_must_root)]
     pub unsafe fn from_box(value: Box<T>) -> Self {
         Self {
-            ptr: Box::into_raw_non_null(value),
+            ptr: Box::leak(value).into(),
         }
     }
 }
@@ -413,52 +418,57 @@ where
 /// An unrooted reference to a DOM object for use in layout. `Layout*Helpers`
 /// traits must be implemented on this.
 #[unrooted_must_root_lint::allow_unrooted_interior]
-pub struct LayoutDom<T> {
-    ptr: ptr::NonNull<T>,
+pub struct LayoutDom<'dom, T> {
+    value: &'dom T,
 }
 
-impl<T: Castable> LayoutDom<T> {
+impl<'dom, T> LayoutDom<'dom, T>
+where
+    T: Castable,
+{
     /// Cast a DOM object root upwards to one of the interfaces it derives from.
-    pub fn upcast<U>(&self) -> LayoutDom<U>
+    pub fn upcast<U>(&self) -> LayoutDom<'dom, U>
     where
         U: Castable,
         T: DerivedFrom<U>,
     {
-        debug_assert!(thread_state::get().is_layout());
-        let ptr: *mut T = self.ptr.as_ptr();
+        assert_in_layout();
         LayoutDom {
-            ptr: unsafe { ptr::NonNull::new_unchecked(ptr as *mut U) },
+            value: self.value.upcast::<U>(),
         }
     }
 
     /// Cast a DOM object downwards to one of the interfaces it might implement.
-    pub fn downcast<U>(&self) -> Option<LayoutDom<U>>
+    pub fn downcast<U>(&self) -> Option<LayoutDom<'dom, U>>
     where
         U: DerivedFrom<T>,
     {
-        debug_assert!(thread_state::get().is_layout());
-        unsafe {
-            if (*self.unsafe_get()).is::<U>() {
-                let ptr: *mut T = self.ptr.as_ptr();
-                Some(LayoutDom {
-                    ptr: ptr::NonNull::new_unchecked(ptr as *mut U),
-                })
-            } else {
-                None
-            }
-        }
+        assert_in_layout();
+        self.value.downcast::<U>().map(|value| LayoutDom { value })
+    }
+
+    /// Returns whether this inner object is a U.
+    pub fn is<U>(&self) -> bool
+    where
+        U: DerivedFrom<T>,
+    {
+        assert_in_layout();
+        self.value.is::<U>()
     }
 }
 
-impl<T: DomObject> LayoutDom<T> {
+impl<T> LayoutDom<'_, T>
+where
+    T: DomObject,
+{
     /// Get the reflector.
     pub unsafe fn get_jsobject(&self) -> *mut JSObject {
-        debug_assert!(thread_state::get().is_layout());
-        (*self.ptr.as_ptr()).reflector().get_jsobject().get()
+        assert_in_layout();
+        self.value.reflector().get_jsobject().get()
     }
 }
 
-impl<T> Copy for LayoutDom<T> {}
+impl<T> Copy for LayoutDom<'_, T> {}
 
 impl<T> PartialEq for Dom<T> {
     fn eq(&self, other: &Dom<T>) -> bool {
@@ -474,13 +484,13 @@ impl<'a, T: DomObject> PartialEq<&'a T> for Dom<T> {
 
 impl<T> Eq for Dom<T> {}
 
-impl<T> PartialEq for LayoutDom<T> {
-    fn eq(&self, other: &LayoutDom<T>) -> bool {
-        self.ptr.as_ptr() == other.ptr.as_ptr()
+impl<T> PartialEq for LayoutDom<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.value as *const T == other.value as *const T
     }
 }
 
-impl<T> Eq for LayoutDom<T> {}
+impl<T> Eq for LayoutDom<'_, T> {}
 
 impl<T> Hash for Dom<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -488,41 +498,39 @@ impl<T> Hash for Dom<T> {
     }
 }
 
-impl<T> Hash for LayoutDom<T> {
+impl<T> Hash for LayoutDom<'_, T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.ptr.as_ptr().hash(state)
+        (self.value as *const T).hash(state)
     }
 }
 
 impl<T> Clone for Dom<T> {
     #[inline]
     #[allow(unrooted_must_root)]
-    fn clone(&self) -> Dom<T> {
-        debug_assert!(thread_state::get().is_script());
+    fn clone(&self) -> Self {
+        assert_in_script();
         Dom {
             ptr: self.ptr.clone(),
         }
     }
 }
 
-impl<T> Clone for LayoutDom<T> {
+impl<T> Clone for LayoutDom<'_, T> {
     #[inline]
-    fn clone(&self) -> LayoutDom<T> {
-        debug_assert!(thread_state::get().is_layout());
-        LayoutDom {
-            ptr: self.ptr.clone(),
-        }
+    fn clone(&self) -> Self {
+        assert_in_layout();
+        LayoutDom { value: self.value }
     }
 }
 
-impl LayoutDom<Node> {
+impl LayoutDom<'_, Node> {
     /// Create a new JS-owned value wrapped from an address known to be a
     /// `Node` pointer.
-    pub unsafe fn from_trusted_node_address(inner: TrustedNodeAddress) -> LayoutDom<Node> {
-        debug_assert!(thread_state::get().is_layout());
+    pub unsafe fn from_trusted_node_address(inner: TrustedNodeAddress) -> Self {
+        assert_in_layout();
         let TrustedNodeAddress(addr) = inner;
         LayoutDom {
-            ptr: ptr::NonNull::new_unchecked(addr as *const Node as *mut Node),
+            value: &*(addr as *const Node),
         }
     }
 }
@@ -541,7 +549,7 @@ pub struct MutDom<T: DomObject> {
 impl<T: DomObject> MutDom<T> {
     /// Create a new `MutDom`.
     pub fn new(initial: &T) -> MutDom<T> {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         MutDom {
             val: UnsafeCell::new(Dom::from_ref(initial)),
         }
@@ -549,7 +557,7 @@ impl<T: DomObject> MutDom<T> {
 
     /// Set this `MutDom` to the given value.
     pub fn set(&self, val: &T) {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         unsafe {
             *self.val.get() = Dom::from_ref(val);
         }
@@ -557,7 +565,7 @@ impl<T: DomObject> MutDom<T> {
 
     /// Get the value in this `MutDom`.
     pub fn get(&self) -> DomRoot<T> {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         unsafe { DomRoot::from_ref(&*ptr::read(self.val.get())) }
     }
 }
@@ -581,6 +589,14 @@ impl<T: DomObject + PartialEq> PartialEq<T> for MutDom<T> {
     }
 }
 
+pub(crate) fn assert_in_script() {
+    debug_assert!(thread_state::get().is_script());
+}
+
+pub(crate) fn assert_in_layout() {
+    debug_assert!(thread_state::get().is_layout());
+}
+
 /// A holder that provides interior mutability for GC-managed values such as
 /// `Dom<T>`, with nullability represented by an enclosing Option wrapper.
 /// Essentially a `Cell<Option<Dom<T>>>`, but safer.
@@ -596,7 +612,7 @@ pub struct MutNullableDom<T: DomObject> {
 impl<T: DomObject> MutNullableDom<T> {
     /// Create a new `MutNullableDom`.
     pub fn new(initial: Option<&T>) -> MutNullableDom<T> {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         MutNullableDom {
             ptr: UnsafeCell::new(initial.map(Dom::from_ref)),
         }
@@ -608,7 +624,7 @@ impl<T: DomObject> MutNullableDom<T> {
     where
         F: FnOnce() -> DomRoot<T>,
     {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         match self.get() {
             Some(inner) => inner,
             None => {
@@ -623,20 +639,20 @@ impl<T: DomObject> MutNullableDom<T> {
     /// For use by layout, which can't use safe types like Temporary.
     #[allow(unrooted_must_root)]
     pub unsafe fn get_inner_as_layout(&self) -> Option<LayoutDom<T>> {
-        debug_assert!(thread_state::get().is_layout());
-        ptr::read(self.ptr.get()).map(|js| js.to_layout())
+        assert_in_layout();
+        (*self.ptr.get()).as_ref().map(|js| js.to_layout())
     }
 
     /// Get a rooted value out of this object
     #[allow(unrooted_must_root)]
     pub fn get(&self) -> Option<DomRoot<T>> {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         unsafe { ptr::read(self.ptr.get()).map(|o| DomRoot::from_ref(&*o)) }
     }
 
     /// Set this `MutNullableDom` to the given value.
     pub fn set(&self, val: Option<&T>) {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         unsafe {
             *self.ptr.get() = val.map(|p| Dom::from_ref(p));
         }
@@ -665,7 +681,7 @@ impl<'a, T: DomObject> PartialEq<Option<&'a T>> for MutNullableDom<T> {
 impl<T: DomObject> Default for MutNullableDom<T> {
     #[allow(unrooted_must_root)]
     fn default() -> MutNullableDom<T> {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         MutNullableDom {
             ptr: UnsafeCell::new(None),
         }
@@ -701,7 +717,7 @@ where
     where
         F: FnOnce() -> DomRoot<T>,
     {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         &self.ptr.init_once(|| Dom::from_ref(&cb()))
     }
 }
@@ -709,7 +725,7 @@ where
 impl<T: DomObject> Default for DomOnceCell<T> {
     #[allow(unrooted_must_root)]
     fn default() -> DomOnceCell<T> {
-        debug_assert!(thread_state::get().is_script());
+        assert_in_script();
         DomOnceCell {
             ptr: OnceCell::new(),
         }
@@ -732,13 +748,24 @@ unsafe impl<T: DomObject> JSTraceable for DomOnceCell<T> {
     }
 }
 
-impl<T: DomObject> LayoutDom<T> {
-    /// Returns an unsafe pointer to the interior of this JS object. This is
-    /// the only method that be safely accessed from layout. (The fact that
-    /// this is unsafe is what necessitates the layout wrappers.)
-    pub unsafe fn unsafe_get(&self) -> *const T {
-        debug_assert!(thread_state::get().is_layout());
-        self.ptr.as_ptr()
+impl<'dom, T> LayoutDom<'dom, T>
+where
+    T: 'dom + DomObject,
+{
+    /// Returns a reference to the interior of this JS object. The fact
+    /// that this is unsafe is what necessitates the layout wrappers.
+    pub unsafe fn unsafe_get(self) -> &'dom T {
+        assert_in_layout();
+        self.value
+    }
+
+    /// Transforms a slice of Dom<T> into a slice of LayoutDom<T>.
+    // FIXME(nox): This should probably be done through a ToLayout trait.
+    pub unsafe fn to_layout_slice(slice: &'dom [Dom<T>]) -> &'dom [LayoutDom<'dom, T>] {
+        // This doesn't compile if Dom and LayoutDom don't have the same
+        // representation.
+        let _ = mem::transmute::<Dom<T>, LayoutDom<T>>;
+        &*(slice as *const [Dom<T>] as *const [LayoutDom<T>])
     }
 }
 

@@ -61,7 +61,7 @@ pub enum CacheState {
 }
 
 /// [Https state](https://fetch.spec.whatwg.org/#concept-response-https-state)
-#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub enum HttpsState {
     None,
     Deprecated,
@@ -310,6 +310,7 @@ impl Response {
             metadata.https_state = response.https_state;
             metadata.referrer = response.referrer.clone();
             metadata.referrer_policy = response.referrer_policy.clone();
+            metadata.redirected = response.actual_response().url_list.len() > 1;
             metadata
         };
 
@@ -340,7 +341,7 @@ impl Response {
                             unsafe_: unsafe_metadata,
                         }),
                         ResponseType::OpaqueRedirect => Ok(FetchMetadata::Filtered {
-                            filtered: FilteredMetadata::OpaqueRedirect,
+                            filtered: FilteredMetadata::OpaqueRedirect(url.clone()),
                             unsafe_: unsafe_metadata,
                         }),
                     }

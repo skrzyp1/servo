@@ -140,12 +140,6 @@ class CheckTidiness(unittest.TestCase):
         self.assertEqual('method declared in webidl is missing a comment with a specification link', next(errors)[2])
         self.assertNoMoreErrors(errors)
 
-    def test_script_thread(self):
-        errors = tidy.collect_errors_for_files(iterFile('script_thread.rs'), [], [tidy.check_rust], print_text=False)
-        self.assertEqual('use a separate variable for the match expression', next(errors)[2])
-        self.assertEqual('use a separate variable for the match expression', next(errors)[2])
-        self.assertNoMoreErrors(errors)
-
     def test_webidl(self):
         errors = tidy.collect_errors_for_files(iterFile('spec.webidl'), [tidy.check_webidl_spec], [], print_text=False)
         self.assertEqual('No specification link found.', next(errors)[2])
@@ -201,14 +195,15 @@ class CheckTidiness(unittest.TestCase):
         errors = tidy.collect_errors_for_files(iterFile('duplicated_package.lock'), [tidy.check_lock], [], print_text=False)
         msg = """duplicate versions for package `test`
 \t\x1b[93mThe following packages depend on version 0.4.9 from 'crates.io':\x1b[0m
-\t\ttest2
-\t\x1b[93mThe following packages depend on version 0.5.1 from 'crates.io':\x1b[0m"""
+\t\ttest2 0.1.0
+\t\x1b[93mThe following packages depend on version 0.5.1 from 'crates.io':\x1b[0m
+\t\ttest3 0.5.1"""
         self.assertEqual(msg, next(errors)[2])
         msg2 = """duplicate versions for package `test3`
 \t\x1b[93mThe following packages depend on version 0.5.1 from 'crates.io':\x1b[0m
-\t\ttest4
+\t\ttest4 0.1.0
 \t\x1b[93mThe following packages depend on version 0.5.1 from 'https://github.com/user/test3':\x1b[0m
-\t\ttest5"""
+\t\ttest5 0.1.0"""
         self.assertEqual(msg2, next(errors)[2])
         self.assertNoMoreErrors(errors)
 

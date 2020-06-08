@@ -5,15 +5,17 @@
 #pragma once
 
 #include "pch.h"
+#include <EGL/egl.h>
 #include "logs.h"
 #include <stdlib.h>
 
 namespace winrt::servo {
 
 namespace capi {
-extern "C" {
-#include <simpleservo.h>
-}
+//extern "C" {
+//#include <simpleservo.h>
+//}
+#include <simpleservo.hh>
 } // namespace capi
 
 hstring char2hstring(const char *);
@@ -23,12 +25,14 @@ class ServoDelegate;
 
 class Servo {
 public:
-  Servo(hstring, hstring, GLsizei, GLsizei, float, ServoDelegate &);
+  Servo(hstring, hstring, GLsizei, GLsizei, EGLNativeWindowType, float,
+        ServoDelegate &);
   ~Servo();
   ServoDelegate &Delegate() { return mDelegate; }
 
   typedef capi::CMouseButton MouseButton;
   typedef capi::CPromptResult PromptResult;
+  typedef capi::CContextMenuResult ContextMenuResult;
   typedef capi::CMediaSessionActionType MediaSessionActionType;
   typedef capi::CMediaSessionPlaybackState MediaSessionPlaybackState;
   typedef capi::CDevtoolsServerState DevtoolsServerState;
@@ -74,6 +78,9 @@ public:
   void SendMediaSessionAction(capi::CMediaSessionActionType action) {
     capi::media_session_action(action);
   }
+  void ContextMenuClosed(capi::CContextMenuResult res, unsigned int idx) {
+    capi::on_context_menu_closed(res, idx);
+  }
 
 private:
   ServoDelegate &mDelegate;
@@ -95,12 +102,12 @@ public:
   virtual bool OnServoAllowNavigation(hstring) = 0;
   virtual void OnServoAnimatingChanged(bool) = 0;
   virtual void OnServoIMEStateChanged(bool) = 0;
-  virtual void OnServoDevtoolsStarted(bool, unsigned int) = 0;
-  virtual void Flush() = 0;
-  virtual void MakeCurrent() = 0;
+  virtual void OnServoDevtoolsStarted(bool, const unsigned int) = 0;
   virtual void OnServoMediaSessionMetadata(hstring, hstring, hstring) = 0;
   virtual void OnServoMediaSessionPlaybackStateChange(int) = 0;
   virtual void OnServoPromptAlert(hstring, bool) = 0;
+  virtual void OnServoShowContextMenu(std::optional<hstring>,
+                                      std::vector<hstring>) = 0;
   virtual Servo::PromptResult OnServoPromptOkCancel(hstring, bool) = 0;
   virtual Servo::PromptResult OnServoPromptYesNo(hstring, bool) = 0;
   virtual std::optional<hstring> OnServoPromptInput(hstring, hstring, bool) = 0;
@@ -113,5 +120,6 @@ protected:
 // pointer as callback in Servo, and these functions need a way to get
 // the Servo instance. See https://github.com/servo/servo/issues/22967
 static Servo *sServo = nullptr;
+static HANDLE sLogHandle = INVALID_HANDLE_VALUE;
 
 } // namespace winrt::servo

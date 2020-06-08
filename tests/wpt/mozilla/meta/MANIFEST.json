@@ -896,6 +896,19 @@
       {}
      ]
     ],
+    "border-radius-image.html": [
+     "2e30ba4bcb40b0fd50ae2c35992e06423720b26e",
+     [
+      null,
+      [
+       [
+        "/_mozilla/css/border-radius-image-ref.html",
+        "=="
+       ]
+      ],
+      {}
+     ]
+    ],
     "border_black_groove.html": [
      "49e1647a6f71e320770225ad537b4fd4020bd700",
      [
@@ -8057,7 +8070,7 @@
      ]
     ],
     "scroll_root.html": [
-     "5896eb3957da1eb85a26680053823d3f3bf9af49",
+     "b1a9cb590b0fcce9c883f99e17fa029a999b699b",
      [
       null,
       [
@@ -8668,6 +8681,10 @@
     ],
     "border-image-linear-gradient-ref.html": [
      "0dddcf89d26d6ac1efe7b0d65e5607a3ed771b46",
+     []
+    ],
+    "border-radius-image-ref.html": [
+     "3aa9bea5a48a4d809fabf1108049a24365edb07f",
      []
     ],
     "border_black_solid.html": [
@@ -10851,7 +10868,7 @@
      []
     ]
    },
-   "lint.whitelist": [
+   "lint.ignore": [
     "314a9e5b44443be1a4e28dd3c5047a5082a7ccab",
     []
    ],
@@ -10971,7 +10988,7 @@
      []
     ],
     "interfaces.js": [
-     "1b841f053a231bf78d29ffe68e59455363c61502",
+     "253dd124cebe9b7d3aa4fc5ff8c9137e7aeb2f66",
      []
     ],
     "nested_asap_script.js": [
@@ -11085,7 +11102,7 @@
      []
     ],
     "scroll_root_ref.html": [
-     "c7d4cfec7b9d9b5daf32841172721ddac3e4d071",
+     "6503ad5d5265c0698f61fc607e2e4e017b31cb6f",
      []
     ],
     "scrolling_div_background_borders_background.png": [
@@ -12832,6 +12849,22 @@
    },
    "css": {
     "animations": {
+     "animation-events.html": [
+      "0975aa64ec47ca4b4c8fc1e0a40414a51719ad67",
+      [
+       null,
+       {
+        "timeout": "long"
+       }
+      ]
+     ],
+     "animation-fill-mode.html": [
+      "4cfaab9fbce0adccd83f592935e63fa8ff58a1cf",
+      [
+       null,
+       {}
+      ]
+     ],
      "basic-linear-width.html": [
       "634b09dca5924b8bea58ac8532d9d46c20d8a0ad",
       [
@@ -12846,6 +12879,13 @@
        {}
       ]
      ],
+     "faster-reversing-of-transitions.html": [
+      "e646a06405d3f32b37e94f797f7a99c6ca54254b",
+      [
+       null,
+       {}
+      ]
+     ],
      "mixed-units.html": [
       "bb029a9fa80650c39e3f9524748e2b8893a476e1",
       [
@@ -12853,8 +12893,15 @@
        {}
       ]
      ],
+     "transition-events.html": [
+      "b561fc8353276e6bdd13a9d1b965f57733ecd19b",
+      [
+       null,
+       {}
+      ]
+     ],
      "transition-raf.html": [
-      "6159bb9ab333544b4485d11025889ee94186c7eb",
+      "c38404503408e04b3c75b42df18ec3a7ec0819f5",
       [
        null,
        {}
@@ -13026,6 +13073,13 @@
     ],
     "test_variable_serialization_specified.html": [
      "5a0e7997ba4470039730f56e9174ed50713aca5e",
+     [
+      null,
+      {}
+     ]
+    ],
+    "transitionend_event.html": [
+     "71b88117a0280fbffcf3ab77105c0460317c66c8",
      [
       null,
       {}
@@ -13863,14 +13917,14 @@
      ]
     ],
     "interfaces.html": [
-     "12f1d0b7f17be6575d4527423aed0ec845c4c2d5",
+     "145c902ff033ba1de46b41dec07992fae4fd2f13",
      [
       null,
       {}
      ]
     ],
     "interfaces.worker.js": [
-     "c1223084790b2980c8184e3cd9ab5ae17bc8b303",
+     "59d4aa1855fbf281736b28581fbc519a847c8a0d",
      [
       "mozilla/interfaces.worker.html",
       {}
@@ -14081,6 +14135,13 @@
       {}
      ]
     ],
+    "overload_dict.html": [
+     "cd42fd97331753fc0580a47a39814cff57911638",
+     [
+      null,
+      {}
+     ]
+    ],
     "paint_timing.html": [
      "0c1798ec565a77d20d9550b5cec352a0b286c415",
      [
@@ -14259,8 +14320,8 @@
      ]
     ],
     "service-workers": {
-     "service-worker-registration.html": [
-      "da46088ca92d8706c40a48fdb3805aaf28bbddd5",
+     "service-worker-registration.https.html": [
+      "04d74fb5c582a3fef8dc589868f0b8c3e402eab2",
       [
        null,
        {}
@@ -14584,18 +14645,32 @@
       null,
       {}
      ]
+    ],
+    "zero_size_canvas_crash.html": [
+     "45eb9b559e8d6105baca5ab4d336de520d33b36b",
+     [
+      null,
+      {}
+     ]
     ]
    },
    "webxr": {
     "create_session.html": [
-     "af76c5a812d7d05a0158194560933def3fbdb9f9",
+     "5b5d485b372bfffb22204bc162c9e182306395cb",
+     [
+      null,
+      {}
+     ]
+    ],
+    "layers.html": [
+     "49821d7661f92bc9cf22232d3fcb391c2cdc7295",
      [
       null,
       {}
      ]
     ],
     "obtain_frame.html": [
-     "74fda5bad43e8ea95552e65380e83952680e8469",
+     "d9ff25729f9cdfd348e7c9914ce2dacd231e13a0",
      [
       null,
       {}

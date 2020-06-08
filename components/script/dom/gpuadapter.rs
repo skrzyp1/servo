@@ -20,7 +20,7 @@ use dom_struct::dom_struct;
 use js::jsapi::{Heap, JSObject};
 use std::ptr::NonNull;
 use std::rc::Rc;
-use webgpu::{wgpu, WebGPU, WebGPUAdapter, WebGPURequest, WebGPUResponse};
+use webgpu::{wgt, WebGPU, WebGPUAdapter, WebGPURequest, WebGPUResponse};
 
 #[dom_struct]
 pub struct GPUAdapter {
@@ -39,8 +39,8 @@ impl GPUAdapter {
         name: DOMString,
         extensions: Heap<*mut JSObject>,
         adapter: WebGPUAdapter,
-    ) -> GPUAdapter {
-        GPUAdapter {
+    ) -> Self {
+        Self {
             reflector_: Reflector::new(),
             channel,
             name,
@@ -55,7 +55,7 @@ impl GPUAdapter {
         name: DOMString,
         extensions: Heap<*mut JSObject>,
         adapter: WebGPUAdapter,
-    ) -> DomRoot<GPUAdapter> {
+    ) -> DomRoot<Self> {
         reflect_dom_object(
             Box::new(GPUAdapter::new_inherited(
                 channel, name, extensions, adapter,
@@ -80,17 +80,16 @@ impl GPUAdapterMethods for GPUAdapter {
     fn RequestDevice(&self, descriptor: &GPUDeviceDescriptor, comp: InRealm) -> Rc<Promise> {
         let promise = Promise::new_in_current_realm(&self.global(), comp);
         let sender = response_async(&promise, self);
-        let desc = wgpu::instance::DeviceDescriptor {
-            extensions: wgpu::instance::Extensions {
-                anisotropic_filtering: descriptor.extensions.anisotropicFiltering,
-            },
-            limits: wgpu::instance::Limits {
+        let desc = wgt::DeviceDescriptor {
+            extensions: wgt::Extensions::empty(),
+            limits: wgt::Limits {
                 max_bind_groups: descriptor.limits.maxBindGroups,
             },
         };
         let id = self
             .global()
             .wgpu_id_hub()
+            .lock()
             .create_device_id(self.adapter.0.backend());
         if self
             .channel

@@ -14,7 +14,7 @@ use crate::dom::bindings::root::{DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::document::Document;
 use crate::dom::domtokenlist::DOMTokenList;
-use crate::dom::element::{AttributeMutation, Element, RawLayoutElementHelpers};
+use crate::dom::element::{AttributeMutation, Element, LayoutElementHelpers};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlelement::HTMLElement;
@@ -480,45 +480,39 @@ impl HTMLIFrameElement {
 }
 
 pub trait HTMLIFrameElementLayoutMethods {
-    fn pipeline_id(&self) -> Option<PipelineId>;
-    fn browsing_context_id(&self) -> Option<BrowsingContextId>;
-    fn get_width(&self) -> LengthOrPercentageOrAuto;
-    fn get_height(&self) -> LengthOrPercentageOrAuto;
+    fn pipeline_id(self) -> Option<PipelineId>;
+    fn browsing_context_id(self) -> Option<BrowsingContextId>;
+    fn get_width(self) -> LengthOrPercentageOrAuto;
+    fn get_height(self) -> LengthOrPercentageOrAuto;
 }
 
-impl HTMLIFrameElementLayoutMethods for LayoutDom<HTMLIFrameElement> {
+impl HTMLIFrameElementLayoutMethods for LayoutDom<'_, HTMLIFrameElement> {
     #[inline]
     #[allow(unsafe_code)]
-    fn pipeline_id(&self) -> Option<PipelineId> {
+    fn pipeline_id(self) -> Option<PipelineId> {
         unsafe { (*self.unsafe_get()).pipeline_id.get() }
     }
 
     #[inline]
     #[allow(unsafe_code)]
-    fn browsing_context_id(&self) -> Option<BrowsingContextId> {
+    fn browsing_context_id(self) -> Option<BrowsingContextId> {
         unsafe { (*self.unsafe_get()).browsing_context_id.get() }
     }
 
-    #[allow(unsafe_code)]
-    fn get_width(&self) -> LengthOrPercentageOrAuto {
-        unsafe {
-            (*self.upcast::<Element>().unsafe_get())
-                .get_attr_for_layout(&ns!(), &local_name!("width"))
-                .map(AttrValue::as_dimension)
-                .cloned()
-                .unwrap_or(LengthOrPercentageOrAuto::Auto)
-        }
+    fn get_width(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("width"))
+            .map(AttrValue::as_dimension)
+            .cloned()
+            .unwrap_or(LengthOrPercentageOrAuto::Auto)
     }
 
-    #[allow(unsafe_code)]
-    fn get_height(&self) -> LengthOrPercentageOrAuto {
-        unsafe {
-            (*self.upcast::<Element>().unsafe_get())
-                .get_attr_for_layout(&ns!(), &local_name!("height"))
-                .map(AttrValue::as_dimension)
-                .cloned()
-                .unwrap_or(LengthOrPercentageOrAuto::Auto)
-        }
+    fn get_height(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("height"))
+            .map(AttrValue::as_dimension)
+            .cloned()
+            .unwrap_or(LengthOrPercentageOrAuto::Auto)
     }
 }
 

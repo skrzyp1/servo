@@ -33,8 +33,8 @@ from mach.decorators import (
 )
 
 from servo.command_base import (
-    BuildNotFound, CommandBase,
-    call, check_call, check_output, set_osmesa_env,
+    CommandBase,
+    call, check_call, check_output,
 )
 from servo.util import host_triple
 
@@ -49,7 +49,7 @@ WEB_PLATFORM_TESTS_PATH = os.path.join("tests", "wpt", "web-platform-tests")
 SERVO_TESTS_PATH = os.path.join("tests", "wpt", "mozilla", "tests")
 
 CLANGFMT_CPP_DIRS = ["support/hololens/"]
-CLANGFMT_VERSION = "8"
+CLANGFMT_VERSION = "9"
 
 TEST_SUITES = OrderedDict([
     ("tidy", {"kwargs": {"all_files": False, "no_progress": False, "self_test": False,
@@ -82,6 +82,8 @@ def create_parser_wpt():
                         help="Servo's JSON logger of unexpected results")
     parser.add_argument('--always-succeed', default=False, action="store_true",
                         help="Always yield exit code of zero")
+    parser.add_argument('--no-default-test-types', default=False, action="store_true",
+                        help="Run all of the test types provided by wptrunner or specified explicitly by --test-types"),
     return parser
 
 
@@ -197,8 +199,6 @@ class MachCommands(CommandBase):
     @CommandArgument('--submit', '-a', default=False, action="store_true",
                      help="submit the data to perfherder")
     def test_perf(self, base=None, date=None, submit=False):
-        self.set_software_rendering_env(True, False)
-
         env = self.build_env()
         cmd = ["bash", "test_perf.sh"]
         if base:
@@ -278,7 +278,9 @@ class MachCommands(CommandBase):
         packages.discard('stylo')
 
         env = self.build_env(test_unit=True)
-        env["RUST_BACKTRACE"] = "1"
+        # FIXME: https://github.com/servo/servo/issues/26192
+        if "apple-darwin" not in host_triple():
+            env["RUST_BACKTRACE"] = "1"
 
         if "msvc" in host_triple():
             # on MSVC, we need some DLLs in the path. They were copied
@@ -441,8 +443,6 @@ class MachCommands(CommandBase):
 
     # Helper for test_css and test_wpt:
     def wptrunner(self, run_file, **kwargs):
-        self.set_software_rendering_env(kwargs['release'], kwargs['debugger'])
-
         # By default, Rayon selects the number of worker threads
         # based on the available CPU count. This doesn't work very
         # well when running tests on CI, since we run so many
@@ -464,6 +464,14 @@ class MachCommands(CommandBase):
             for pref in prefs:
                 binary_args.append("--pref=" + pref)
             kwargs["binary_args"] = binary_args
+
+        if not kwargs.get('no_default_test_types'):
+            test_types = {
+                "servo": ["testharness", "reftest", "wdspec"],
+                "servodriver": ["testharness", "reftest"],
+            }
+            product = kwargs.get("product") or "servo"
+            kwargs["test_types"] = test_types[product]
 
         run_globals = {"__file__": run_file}
         exec(compile(open(run_file).read(), run_file, 'exec'), run_globals)
@@ -752,18 +760,6 @@ class MachCommands(CommandBase):
 
         return check_call(
             [run_file, "|".join(tests), bin_path, base_dir])
-
-    def set_software_rendering_env(self, use_release, show_vars):
-        # On Linux and mac, find the OSMesa software rendering library and
-        # add it to the dynamic linker search path.
-        try:
-            bin_path = self.get_binary_path(use_release, not use_release)
-            if not set_osmesa_env(bin_path, os.environ, show_vars):
-                print("Warning: Cannot set the path to OSMesa library.")
-        except BuildNotFound:
-            # This can occur when cross compiling (e.g. arm64), in which case
-            # we won't run the tests anyway so can safely ignore this step.
-            pass
 
 
 def setup_clangfmt(env):

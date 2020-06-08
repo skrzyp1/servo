@@ -9,7 +9,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::root::LayoutDom;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
-use crate::dom::element::{Element, RawLayoutElementHelpers};
+use crate::dom::element::{Element, LayoutElementHelpers};
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmltablerowelement::HTMLTableRowElement;
 use crate::dom::node::Node;
@@ -45,12 +45,15 @@ impl HTMLTableCellElement {
         prefix: Option<Prefix>,
         document: &Document,
     ) -> DomRoot<HTMLTableCellElement> {
-        Node::reflect_node(
+        let n = Node::reflect_node(
             Box::new(HTMLTableCellElement::new_inherited(
                 local_name, prefix, document,
             )),
             document,
-        )
+        );
+
+        n.upcast::<Node>().set_weird_parser_insertion_mode();
+        n
     }
 }
 
@@ -98,47 +101,38 @@ impl HTMLTableCellElementMethods for HTMLTableCellElement {
 }
 
 pub trait HTMLTableCellElementLayoutHelpers {
-    fn get_background_color(&self) -> Option<RGBA>;
-    fn get_colspan(&self) -> Option<u32>;
-    fn get_rowspan(&self) -> Option<u32>;
-    fn get_width(&self) -> LengthOrPercentageOrAuto;
+    fn get_background_color(self) -> Option<RGBA>;
+    fn get_colspan(self) -> Option<u32>;
+    fn get_rowspan(self) -> Option<u32>;
+    fn get_width(self) -> LengthOrPercentageOrAuto;
 }
 
-#[allow(unsafe_code)]
-impl HTMLTableCellElementLayoutHelpers for LayoutDom<HTMLTableCellElement> {
-    fn get_background_color(&self) -> Option<RGBA> {
-        unsafe {
-            (&*self.upcast::<Element>().unsafe_get())
-                .get_attr_for_layout(&ns!(), &local_name!("bgcolor"))
-                .and_then(AttrValue::as_color)
-                .cloned()
-        }
+impl HTMLTableCellElementLayoutHelpers for LayoutDom<'_, HTMLTableCellElement> {
+    fn get_background_color(self) -> Option<RGBA> {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("bgcolor"))
+            .and_then(AttrValue::as_color)
+            .cloned()
     }
 
-    fn get_colspan(&self) -> Option<u32> {
-        unsafe {
-            (&*self.upcast::<Element>().unsafe_get())
-                .get_attr_for_layout(&ns!(), &local_name!("colspan"))
-                .map(AttrValue::as_uint)
-        }
+    fn get_colspan(self) -> Option<u32> {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("colspan"))
+            .map(AttrValue::as_uint)
     }
 
-    fn get_rowspan(&self) -> Option<u32> {
-        unsafe {
-            (&*self.upcast::<Element>().unsafe_get())
-                .get_attr_for_layout(&ns!(), &local_name!("rowspan"))
-                .map(AttrValue::as_uint)
-        }
+    fn get_rowspan(self) -> Option<u32> {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("rowspan"))
+            .map(AttrValue::as_uint)
     }
 
-    fn get_width(&self) -> LengthOrPercentageOrAuto {
-        unsafe {
-            (&*self.upcast::<Element>().unsafe_get())
-                .get_attr_for_layout(&ns!(), &local_name!("width"))
-                .map(AttrValue::as_dimension)
-                .cloned()
-                .unwrap_or(LengthOrPercentageOrAuto::Auto)
-        }
+    fn get_width(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("width"))
+            .map(AttrValue::as_dimension)
+            .cloned()
+            .unwrap_or(LengthOrPercentageOrAuto::Auto)
     }
 }
 

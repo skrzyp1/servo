@@ -90,9 +90,17 @@ interface mixin GlobalEventHandlers {
            attribute EventHandler onwaiting;
 };
 
+// https://drafts.csswg.org/css-animations/#interface-globaleventhandlers-idl
+partial interface mixin GlobalEventHandlers {
+           attribute EventHandler onanimationend;
+           attribute EventHandler onanimationiteration;
+};
+
 // https://drafts.csswg.org/css-transitions/#interface-globaleventhandlers-idl
 partial interface mixin GlobalEventHandlers {
+           attribute EventHandler ontransitionrun;
            attribute EventHandler ontransitionend;
+           attribute EventHandler ontransitioncancel;
 };
 
 // https://w3c.github.io/selection-api/#extensions-to-globaleventhandlers-interface
@@ -120,17 +128,6 @@ interface mixin WindowEventHandlers {
            attribute EventHandler onstorage;
            attribute EventHandler onunhandledrejection;
            attribute EventHandler onunload;
-};
-
-// https://w3c.github.io/webvr/spec/1.1/#interface-window
-partial interface mixin WindowEventHandlers {
-           attribute EventHandler onvrdisplayconnect;
-           attribute EventHandler onvrdisplaydisconnect;
-           attribute EventHandler onvrdisplayactivate;
-           attribute EventHandler onvrdisplaydeactivate;
-           attribute EventHandler onvrdisplayblur;
-           attribute EventHandler onvrdisplayfocus;
-           attribute EventHandler onvrdisplaypresentchange;
 };
 
 // https://html.spec.whatwg.org/multipage/#documentandelementeventhandlers

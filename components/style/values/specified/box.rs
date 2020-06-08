@@ -34,6 +34,17 @@ fn moz_box_display_values_enabled(context: &ParserContext) -> bool {
         static_prefs::pref!("layout.css.xul-box-display-values.content.enabled")
 }
 
+fn flexbox_enabled() -> bool {
+    if cfg!(feature = "servo-layout-2020") {
+        servo_config::prefs::pref_map()
+            .get("layout.flexbox.enabled")
+            .as_bool()
+            .unwrap_or(false)
+    } else {
+        true
+    }
+}
+
 /// Defines an element’s display type, which consists of
 /// the two basic qualities of how an element generates boxes
 /// <https://drafts.csswg.org/css-display/#propdef-display>
@@ -63,7 +74,6 @@ pub enum DisplayInside {
     Contents,
     Flow,
     FlowRoot,
-    #[cfg(any(feature = "servo-layout-2013", feature = "gecko"))]
     Flex,
     #[cfg(feature = "gecko")]
     Grid,
@@ -103,6 +113,8 @@ pub enum DisplayInside {
     MozGridGroup,
     #[cfg(feature = "gecko")]
     MozGridLine,
+    #[cfg(feature = "gecko")]
+    MozStack,
     #[cfg(feature = "gecko")]
     MozDeck,
     #[cfg(feature = "gecko")]
@@ -144,9 +156,7 @@ impl Display {
     pub const Block: Self = Self::new(DisplayOutside::Block, DisplayInside::Flow);
     #[cfg(feature = "gecko")]
     pub const FlowRoot: Self = Self::new(DisplayOutside::Block, DisplayInside::FlowRoot);
-    #[cfg(any(feature = "servo-layout-2013", feature = "gecko"))]
     pub const Flex: Self = Self::new(DisplayOutside::Block, DisplayInside::Flex);
-    #[cfg(any(feature = "servo-layout-2013", feature = "gecko"))]
     pub const InlineFlex: Self = Self::new(DisplayOutside::Inline, DisplayInside::Flex);
     #[cfg(feature = "gecko")]
     pub const Grid: Self = Self::new(DisplayOutside::Block, DisplayInside::Grid);
@@ -226,6 +236,8 @@ impl Display {
     pub const MozGridGroup: Self = Self::new(DisplayOutside::XUL, DisplayInside::MozGridGroup);
     #[cfg(feature = "gecko")]
     pub const MozGridLine: Self = Self::new(DisplayOutside::XUL, DisplayInside::MozGridLine);
+    #[cfg(feature = "gecko")]
+    pub const MozStack: Self = Self::new(DisplayOutside::XUL, DisplayInside::MozStack);
     #[cfg(feature = "gecko")]
     pub const MozDeck: Self = Self::new(DisplayOutside::XUL, DisplayInside::MozDeck);
     #[cfg(feature = "gecko")]
@@ -313,9 +325,9 @@ impl Display {
     #[inline]
     pub fn is_atomic_inline_level(&self) -> bool {
         match *self {
-            Display::InlineBlock => true,
+            Display::InlineBlock | Display::InlineFlex => true,
             #[cfg(any(feature = "servo-layout-2013"))]
-            Display::InlineFlex | Display::InlineTable => true,
+            Display::InlineTable => true,
             _ => false,
         }
     }
@@ -326,7 +338,6 @@ impl Display {
     /// This is used to implement various style fixups.
     pub fn is_item_container(&self) -> bool {
         match self.inside() {
-            #[cfg(any(feature = "servo-layout-2013", feature = "gecko"))]
             DisplayInside::Flex => true,
             #[cfg(feature = "gecko")]
             DisplayInside::Grid => true,
@@ -350,7 +361,7 @@ impl Display {
     ///
     /// Also used for :root style adjustments.
     pub fn equivalent_block_display(&self, _is_root_element: bool) -> Self {
-        #[cfg(feature = "gecko")]
+        #[cfg(any(feature = "servo-layout-2020", feature = "gecko"))]
         {
             // Special handling for `contents` and `list-item`s on the root element.
             if _is_root_element && (self.is_contents() || self.is_list_item()) {
@@ -396,7 +407,7 @@ impl Display {
     #[inline]
     pub fn is_contents(&self) -> bool {
         match *self {
-            #[cfg(feature = "gecko")]
+            #[cfg(any(feature = "servo-layout-2020", feature = "gecko"))]
             Display::Contents => true,
             _ => false,
         }
@@ -428,12 +439,9 @@ impl ToCss for Display {
             _ => match (outside, inside) {
                 #[cfg(feature = "gecko")]
                 (DisplayOutside::Inline, DisplayInside::Grid) => dest.write_str("inline-grid"),
+                (DisplayOutside::Inline, DisplayInside::Flex) => dest.write_str("inline-flex"),
                 #[cfg(any(feature = "servo-layout-2013", feature = "gecko"))]
-                (DisplayOutside::Inline, DisplayInside::Flex) |
-                (DisplayOutside::Inline, DisplayInside::Table) => {
-                    dest.write_str("inline-")?;
-                    inside.to_css(dest)
-                },
+                (DisplayOutside::Inline, DisplayInside::Table) => dest.write_str("inline-table"),
                 #[cfg(feature = "gecko")]
                 (DisplayOutside::Block, DisplayInside::Ruby) => dest.write_str("block ruby"),
                 (_, inside) => {
@@ -463,12 +471,11 @@ fn parse_display_inside<'i, 't>(
 ) -> Result<DisplayInside, ParseError<'i>> {
     Ok(try_match_ident_ignore_ascii_case! { input,
         "flow" => DisplayInside::Flow,
+        "flex" if flexbox_enabled() => DisplayInside::Flex,
         #[cfg(any(feature = "servo-layout-2020", feature = "gecko"))]
         "flow-root" => DisplayInside::FlowRoot,
         #[cfg(any(feature = "servo-layout-2013", feature = "gecko"))]
         "table" => DisplayInside::Table,
-        #[cfg(any(feature = "servo-layout-2013", feature = "gecko"))]
-        "flex" => DisplayInside::Flex,
         #[cfg(feature = "gecko")]
         "grid" => DisplayInside::Grid,
         #[cfg(feature = "gecko")]
@@ -571,10 +578,8 @@ impl Parse for Display {
             "inline-block" => Display::InlineBlock,
             #[cfg(any(feature = "servo-layout-2013", feature = "gecko"))]
             "inline-table" => Display::InlineTable,
-            #[cfg(any(feature = "servo-layout-2013", feature = "gecko"))]
-            "-webkit-flex" => Display::Flex,
-            #[cfg(any(feature = "servo-layout-2013", feature = "gecko"))]
-            "inline-flex" | "-webkit-inline-flex" => Display::InlineFlex,
+            "-webkit-flex" if flexbox_enabled() => Display::Flex,
+            "inline-flex" | "-webkit-inline-flex" if flexbox_enabled() => Display::InlineFlex,
             #[cfg(feature = "gecko")]
             "inline-grid" => Display::InlineGrid,
             #[cfg(any(feature = "servo-layout-2013", feature = "gecko"))]
@@ -615,6 +620,8 @@ impl Parse for Display {
             "-moz-grid-group" if moz_display_values_enabled(context) => Display::MozGridGroup,
             #[cfg(feature = "gecko")]
             "-moz-grid-line" if moz_display_values_enabled(context) => Display::MozGridLine,
+            #[cfg(feature = "gecko")]
+            "-moz-stack" if moz_display_values_enabled(context) => Display::MozStack,
             #[cfg(feature = "gecko")]
             "-moz-deck" if moz_display_values_enabled(context) => Display::MozDeck,
             #[cfg(feature = "gecko")]
@@ -1595,7 +1602,7 @@ pub enum Appearance {
     Meterchunk,
     /// The "arrowed" part of the dropdown button that open up a dropdown list.
     #[parse(condition = "ParserContext::in_ua_or_chrome_sheet")]
-    MozMenulistButton,
+    MozMenulistArrowButton,
     /// For HTML's <input type=number>
     NumberInput,
     /// A horizontal progress bar.
@@ -1624,7 +1631,7 @@ pub enum Appearance {
     RadioLabel,
     /// nsRangeFrame and its subparts
     Range,
-    RangeThumb,
+    RangeThumb, // FIXME: This should not be exposed to content.
     /// The resizer background area in a status bar for the resizer widget in
     /// the corner of a window.
     #[parse(condition = "ParserContext::in_ua_or_chrome_sheet")]
@@ -1848,6 +1855,14 @@ pub enum Appearance {
     /// A dummy variant that should be last to let the GTK widget do hackery.
     #[css(skip)]
     Count,
+}
+
+impl Appearance {
+    /// Returns whether we're the `none` value.
+    #[inline]
+    pub fn is_none(self) -> bool {
+        self == Appearance::None
+    }
 }
 
 /// A kind of break between two boxes.

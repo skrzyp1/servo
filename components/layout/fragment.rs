@@ -411,10 +411,10 @@ impl ImageFragmentInfo {
     ///
     /// FIXME(pcwalton): The fact that image fragments store the cache in the fragment makes little
     /// sense to me.
-    pub fn new<N: ThreadSafeLayoutNode>(
+    pub fn new<'dom>(
         url: Option<ServoUrl>,
         density: Option<f64>,
-        node: &N,
+        node: &impl ThreadSafeLayoutNode<'dom>,
         layout_context: &LayoutContext,
     ) -> ImageFragmentInfo {
         // First use any image data present in the element...
@@ -431,8 +431,8 @@ impl ImageFragmentInfo {
                     layout_context
                         .get_or_request_image_or_meta(node.opaque(), url, UsePlaceholder::Yes)
                         .map(|result| match result {
-                            ImageOrMetadataAvailable::ImageAvailable(i, _) => {
-                                ImageOrMetadata::Image(i)
+                            ImageOrMetadataAvailable::ImageAvailable { image, .. } => {
+                                ImageOrMetadata::Image(image)
                             },
                             ImageOrMetadataAvailable::MetadataAvailable(m) => {
                                 ImageOrMetadata::Metadata(m)
@@ -488,7 +488,7 @@ pub struct IframeFragmentInfo {
 
 impl IframeFragmentInfo {
     /// Creates the information specific to an iframe fragment.
-    pub fn new<N: ThreadSafeLayoutNode>(node: &N) -> IframeFragmentInfo {
+    pub fn new<'dom>(node: &impl ThreadSafeLayoutNode<'dom>) -> IframeFragmentInfo {
         let browsing_context_id = node.iframe_browsing_context_id();
         let pipeline_id = node.iframe_pipeline_id();
         IframeFragmentInfo {
@@ -642,7 +642,7 @@ pub struct TableColumnFragmentInfo {
 
 impl TableColumnFragmentInfo {
     /// Create the information specific to an table column fragment.
-    pub fn new<N: ThreadSafeLayoutNode>(node: &N) -> TableColumnFragmentInfo {
+    pub fn new<'dom>(node: &impl ThreadSafeLayoutNode<'dom>) -> TableColumnFragmentInfo {
         let element = node.as_element().unwrap();
         let span = element
             .get_attr(&ns!(), &local_name!("span"))
@@ -663,8 +663,8 @@ pub struct TruncatedFragmentInfo {
 
 impl Fragment {
     /// Constructs a new `Fragment` instance.
-    pub fn new<N: ThreadSafeLayoutNode>(
-        node: &N,
+    pub fn new<'dom>(
+        node: &impl ThreadSafeLayoutNode<'dom>,
         specific: SpecificFragmentInfo,
         ctx: &LayoutContext,
     ) -> Fragment {

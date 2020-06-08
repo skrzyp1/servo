@@ -20,7 +20,6 @@ pub use crate::origin::{ImmutableOrigin, MutableOrigin, OpaqueOrigin};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::Hasher;
-use std::mem::ManuallyDrop;
 use std::net::IpAddr;
 use std::ops::{Index, Range, RangeFrom, RangeFull, RangeTo};
 use std::path::Path;
@@ -34,7 +33,7 @@ pub use url::Host;
 pub struct ServoUrl(#[ignore_malloc_size_of = "Arc"] Arc<Url>);
 
 impl ToShmem for ServoUrl {
-    fn to_shmem(&self, _builder: &mut SharedMemoryBuilder) -> ManuallyDrop<Self> {
+    fn to_shmem(&self, _builder: &mut SharedMemoryBuilder) -> to_shmem::Result<Self> {
         unimplemented!("If servo wants to share stylesheets across processes, ToShmem for Url must be implemented")
     }
 }
@@ -168,6 +167,32 @@ impl ServoUrl {
 
     pub fn from_file_path<P: AsRef<Path>>(path: P) -> Result<Self, ()> {
         Ok(Self::from_url(Url::from_file_path(path)?))
+    }
+
+    // https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy
+    pub fn is_origin_trustworthy(&self) -> bool {
+        // Step 1
+        if !self.origin().is_tuple() {
+            return false;
+        }
+
+        // Step 3
+        if self.scheme() == "https" || self.scheme() == "wss" {
+            true
+        // Steps 4-5
+        } else if self.host().is_some() {
+            let host = self.host_str().unwrap();
+            // Step 4
+            if let Ok(ip_addr) = host.parse::<IpAddr>() {
+                ip_addr.is_loopback()
+            // Step 5
+            } else {
+                host == "localhost" || host.ends_with(".localhost")
+            }
+        // Step 6
+        } else {
+            self.scheme() == "file"
+        }
     }
 }
 

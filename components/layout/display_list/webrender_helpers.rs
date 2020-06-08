@@ -7,7 +7,7 @@
 //           This might be achieved by sharing types between WR and Servo display lists, or
 //           completely converting layout to directly generate WebRender display lists, for example.
 
-use crate::display_list::items::{BaseDisplayItem, ClipScrollNode, ClipScrollNodeType};
+use crate::display_list::items::{BaseDisplayItem, ClipScrollNode, ClipScrollNodeType, ClipType};
 use crate::display_list::items::{DisplayItem, DisplayList, StackingContextType};
 use msg::constellation_msg::PipelineId;
 use webrender_api::units::LayoutPoint;
@@ -186,7 +186,7 @@ impl DisplayItem {
                 );
                 IsContentful(false)
             },
-            DisplayItem::PushStackingContext(ref mut item) => {
+            DisplayItem::PushStackingContext(ref item) => {
                 let stacking_context = &item.stacking_context;
                 debug_assert_eq!(stacking_context.context_type, StackingContextType::Real);
 
@@ -252,8 +252,11 @@ impl DisplayItem {
                 builder.push_item(&WrDisplayItem::PushStackingContext(wr_item));
                 IsContentful(false)
             },
-            DisplayItem::PopStackingContext(_) => {
+            DisplayItem::PopStackingContext(ref item) => {
                 builder.pop_stacking_context();
+                if item.established_reference_frame {
+                    builder.pop_reference_frame();
+                }
                 IsContentful(false)
             },
             DisplayItem::DefineClipScrollNode(ref mut item) => {
@@ -266,16 +269,19 @@ impl DisplayItem {
                     .expect("Tried to use WebRender parent ClipId before it was defined.");
 
                 match node.node_type {
-                    ClipScrollNodeType::Clip => {
-                        let id = builder.define_clip(
-                            &SpaceAndClipInfo {
-                                clip_id: parent_clip_id,
-                                spatial_id: parent_spatial_id,
+                    ClipScrollNodeType::Clip(clip_type) => {
+                        let space_and_clip_info = SpaceAndClipInfo {
+                            clip_id: parent_clip_id,
+                            spatial_id: parent_spatial_id,
+                        };
+                        let id = match clip_type {
+                            ClipType::Rect => {
+                                builder.define_clip_rect(&space_and_clip_info, item_rect)
                             },
-                            item_rect,
-                            node.clip.complex.clone(),
-                            None,
-                        );
+                            ClipType::Rounded(complex) => {
+                                builder.define_clip_rounded_rect(&space_and_clip_info, complex)
+                            },
+                        };
 
                         state.spatial_ids[item.node_index.to_index()] = Some(parent_spatial_id);
                         state.clip_ids[item.node_index.to_index()] = Some(id);
@@ -289,8 +295,6 @@ impl DisplayItem {
                             Some(external_id),
                             node.content_rect,
                             node.clip.main,
-                            node.clip.complex.clone(),
-                            None,
                             scroll_sensitivity,
                             webrender_api::units::LayoutVector2D::zero(),
                         );
@@ -338,6 +342,5 @@ fn build_common_item_properties(
         // TODO(gw): Make use of the WR backface visibility functionality.
         flags: PrimitiveFlags::default(),
         hit_info: tag,
-        item_key: None,
     }
 }

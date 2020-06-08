@@ -8,18 +8,21 @@ extern crate log;
 pub mod gl_glue;
 
 pub use servo::embedder_traits::{
-    MediaSessionPlaybackState, PermissionPrompt, PermissionRequest, PromptResult,
+    ContextMenuResult, MediaSessionPlaybackState, PermissionPrompt, PermissionRequest, PromptResult,
 };
 pub use servo::script_traits::{MediaSessionActionType, MouseButton};
 
 use getopts::Options;
+use ipc_channel::ipc::IpcSender;
 use servo::canvas::{SurfaceProviders, WebGlExecutor};
 use servo::compositing::windowing::{
     AnimationState, EmbedderCoordinates, EmbedderMethods, MouseWindowEvent, WindowEvent,
     WindowMethods,
 };
 use servo::embedder_traits::resources::{self, Resource, ResourceReaderMethods};
-use servo::embedder_traits::{EmbedderMsg, MediaSessionEvent, PromptDefinition, PromptOrigin};
+use servo::embedder_traits::{
+    EmbedderMsg, EmbedderProxy, MediaSessionEvent, PromptDefinition, PromptOrigin,
+};
 use servo::euclid::{Point2D, Rect, Scale, Size2D, Vector2D};
 use servo::keyboard_types::{Key, KeyState, KeyboardEvent};
 use servo::msg::constellation_msg::TraversalDirection;
@@ -29,7 +32,7 @@ use servo::servo_config::{pref, set_pref};
 use servo::servo_url::ServoUrl;
 use servo::webrender_api::units::DevicePixel;
 use servo::webrender_api::ScrollLocation;
-use servo::webvr::{VRExternalShmemPtr, VRMainThreadHeartbeat, VRService, VRServiceManager};
+use servo::webrender_surfman::WebrenderSurfman;
 use servo::{self, gl, BrowserId, Servo};
 use servo_media::player::context as MediaPlayerContext;
 use std::cell::RefCell;
@@ -37,6 +40,9 @@ use std::mem;
 use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::rc::Rc;
+use surfman::Adapter;
+use surfman::Connection;
+use surfman::SurfaceType;
 
 thread_local! {
     pub static SERVO: RefCell<Option<ServoGlue>> = RefCell::new(None);
@@ -52,17 +58,11 @@ pub struct InitOptions {
     pub url: Option<String>,
     pub coordinates: Coordinates,
     pub density: f32,
-    pub vr_init: VRInitOptions,
     pub xr_discovery: Option<webxr::Discovery>,
     pub enable_subpixel_text_antialiasing: bool,
     pub gl_context_pointer: Option<*const c_void>,
     pub native_display_pointer: Option<*const c_void>,
-}
-
-pub enum VRInitOptions {
-    None,
-    VRExternal(*mut c_void),
-    VRService(Box<dyn VRService>, Box<dyn VRMainThreadHeartbeat>),
+    pub native_widget: *mut c_void,
 }
 
 #[derive(Clone, Debug)]
@@ -89,12 +89,6 @@ impl Coordinates {
 
 /// Callbacks. Implemented by embedder. Called by Servo.
 pub trait HostTrait {
-    /// Will be called from the thread used for the init call.
-    /// Will be called when the GL buffer has been updated.
-    fn flush(&self);
-    /// Will be called before drawing.
-    /// Time to make the targetted GL context current.
-    fn make_current(&self);
     /// Show alert.
     fn prompt_alert(&self, msg: String, trusted: bool);
     /// Ask Yes/No question.
@@ -103,6 +97,8 @@ pub trait HostTrait {
     fn prompt_ok_cancel(&self, msg: String, trusted: bool) -> PromptResult;
     /// Ask for string
     fn prompt_input(&self, msg: String, default: String, trusted: bool) -> Option<String>;
+    /// Show context menu
+    fn show_context_menu(&self, title: Option<String>, items: Vec<String>);
     /// Page starts loading.
     /// "Reload button" should be disabled.
     /// "Stop button" should be enabled.
@@ -164,6 +160,7 @@ pub struct ServoGlue {
     browsers: Vec<BrowserId>,
     events: Vec<WindowEvent>,
     current_url: Option<ServoUrl>,
+    context_menu_sender: Option<IpcSender<ContextMenuResult>>,
 }
 
 pub fn servo_version() -> String {
@@ -213,23 +210,40 @@ pub fn init(
     gl.clear(gl::COLOR_BUFFER_BIT);
     gl.finish();
 
+    // Initialize surfman
+    let connection = Connection::new().or(Err("Failed to create connection"))?;
+    let adapter = match create_adapter() {
+        Some(adapter) => adapter,
+        None => connection
+            .create_adapter()
+            .or(Err("Failed to create adapter"))?,
+    };
+    let native_widget = unsafe {
+        connection.create_native_widget_from_ptr(
+            init_opts.native_widget,
+            init_opts.coordinates.framebuffer.to_untyped(),
+        )
+    };
+    let surface_type = SurfaceType::Widget { native_widget };
+    let webrender_surfman = WebrenderSurfman::create(&connection, &adapter, surface_type)
+        .or(Err("Failed to create surface manager"))?;
+
     let window_callbacks = Rc::new(ServoWindowCallbacks {
         host_callbacks: callbacks,
-        gl: gl.clone(),
         coordinates: RefCell::new(init_opts.coordinates),
         density: init_opts.density,
         gl_context_pointer: init_opts.gl_context_pointer,
         native_display_pointer: init_opts.native_display_pointer,
+        webrender_surfman,
     });
 
     let embedder_callbacks = Box::new(ServoEmbedderCallbacks {
-        vr_init: init_opts.vr_init,
         xr_discovery: init_opts.xr_discovery,
         waker,
         gl: gl.clone(),
     });
 
-    let servo = Servo::new(embedder_callbacks, window_callbacks.clone());
+    let servo = Servo::new(embedder_callbacks, window_callbacks.clone(), None);
 
     SERVO.with(|s| {
         let mut servo_glue = ServoGlue {
@@ -240,6 +254,7 @@ pub fn init(
             browsers: vec![],
             events: vec![],
             current_url: Some(url.clone()),
+            context_menu_sender: None,
         };
         let browser_id = BrowserId::new();
         let _ = servo_glue.process_event(WindowEvent::NewBrowser(url, browser_id));
@@ -503,6 +518,18 @@ impl ServoGlue {
         }
     }
 
+    pub fn on_context_menu_closed(
+        &mut self,
+        result: ContextMenuResult,
+    ) -> Result<(), &'static str> {
+        if let Some(sender) = self.context_menu_sender.take() {
+            let _ = sender.send(result);
+        } else {
+            warn!("Trying to close a context menu when no context menu is active");
+        }
+        Ok(())
+    }
+
     fn process_event(&mut self, event: WindowEvent) -> Result<(), &'static str> {
         self.events.push(event);
         if !self.batch_mode {
@@ -561,6 +588,19 @@ impl ServoGlue {
                 },
                 EmbedderMsg::AllowUnload(sender) => {
                     let _ = sender.send(true);
+                },
+                EmbedderMsg::ShowContextMenu(sender, title, items) => {
+                    if self.context_menu_sender.is_some() {
+                        warn!(
+                            "Trying to show a context menu when a context menu is already active"
+                        );
+                        let _ = sender.send(ContextMenuResult::Ignored);
+                    } else {
+                        self.context_menu_sender = Some(sender);
+                        self.callbacks
+                            .host_callbacks
+                            .show_context_menu(title, items);
+                    }
                 },
                 EmbedderMsg::Prompt(definition, origin) => {
                     let cb = &self.callbacks.host_callbacks;
@@ -695,46 +735,30 @@ impl ServoGlue {
 struct ServoEmbedderCallbacks {
     waker: Box<dyn EventLoopWaker>,
     xr_discovery: Option<webxr::Discovery>,
-    vr_init: VRInitOptions,
     #[allow(unused)]
     gl: Rc<dyn gl::Gl>,
 }
 
 struct ServoWindowCallbacks {
-    gl: Rc<dyn gl::Gl>,
     host_callbacks: Box<dyn HostTrait>,
     coordinates: RefCell<Coordinates>,
     density: f32,
     gl_context_pointer: Option<*const c_void>,
     native_display_pointer: Option<*const c_void>,
+    webrender_surfman: WebrenderSurfman,
 }
 
 impl EmbedderMethods for ServoEmbedderCallbacks {
-    fn register_vr_services(
-        &mut self,
-        services: &mut VRServiceManager,
-        heartbeats: &mut Vec<Box<dyn VRMainThreadHeartbeat>>,
-    ) {
-        debug!("EmbedderMethods::register_vrexternal");
-        match mem::replace(&mut self.vr_init, VRInitOptions::None) {
-            VRInitOptions::None => {},
-            VRInitOptions::VRExternal(ptr) => {
-                services.register_vrexternal(VRExternalShmemPtr::new(ptr));
-            },
-            VRInitOptions::VRService(service, heartbeat) => {
-                services.register(service);
-                heartbeats.push(heartbeat);
-            },
-        }
-    }
-
     #[cfg(feature = "uwp")]
     fn register_webxr(
         &mut self,
         registry: &mut webxr::MainThreadRegistry,
         executor: WebGlExecutor,
         surface_providers: SurfaceProviders,
+        embedder_proxy: EmbedderProxy,
     ) {
+        use ipc_channel::ipc::{self, IpcReceiver};
+        use webxr::openxr;
         debug!("EmbedderMethods::register_xr");
         assert!(
             self.xr_discovery.is_none(),
@@ -742,18 +766,56 @@ impl EmbedderMethods for ServoEmbedderCallbacks {
         );
 
         struct ProviderRegistration(SurfaceProviders);
-        impl webxr::openxr::SurfaceProviderRegistration for ProviderRegistration {
+        impl openxr::SurfaceProviderRegistration for ProviderRegistration {
             fn register(&self, id: webxr_api::SessionId, provider: servo::canvas::SurfaceProvider) {
                 self.0.lock().unwrap().insert(id, provider);
             }
-            fn clone(&self) -> Box<dyn webxr::openxr::SurfaceProviderRegistration> {
+            fn clone(&self) -> Box<dyn openxr::SurfaceProviderRegistration> {
                 Box::new(ProviderRegistration(self.0.clone()))
             }
         }
 
+        #[derive(Clone)]
+        struct ContextMenuCallback(EmbedderProxy);
+
+        struct ContextMenuFuture(IpcReceiver<ContextMenuResult>);
+
+        impl openxr::ContextMenuProvider for ContextMenuCallback {
+            fn open_context_menu(&self) -> Box<dyn openxr::ContextMenuFuture> {
+                let (sender, receiver) = ipc::channel().unwrap();
+                self.0.send((
+                    None,
+                    EmbedderMsg::ShowContextMenu(
+                        sender,
+                        Some("Would you like to exit the XR session?".into()),
+                        vec!["Exit".into()],
+                    ),
+                ));
+
+                Box::new(ContextMenuFuture(receiver))
+            }
+            fn clone_object(&self) -> Box<dyn openxr::ContextMenuProvider> {
+                Box::new(self.clone())
+            }
+        }
+
+        impl openxr::ContextMenuFuture for ContextMenuFuture {
+            fn poll(&self) -> openxr::ContextMenuResult {
+                if let Ok(result) = self.0.try_recv() {
+                    if let ContextMenuResult::Selected(0) = result {
+                        openxr::ContextMenuResult::ExitSession
+                    } else {
+                        openxr::ContextMenuResult::Dismissed
+                    }
+                } else {
+                    openxr::ContextMenuResult::Pending
+                }
+            }
+        }
+
         struct GlThread(WebGlExecutor);
-        impl webxr::openxr::GlThread for GlThread {
-            fn execute(&self, runnable: Box<dyn FnOnce() + Send>) {
+        impl openxr::GlThread for GlThread {
+            fn execute(&self, runnable: Box<dyn FnOnce(&surfman::Device) + Send>) {
                 let _ = self.0.send(runnable);
             }
             fn clone(&self) -> Box<dyn webxr::openxr::GlThread> {
@@ -761,11 +823,27 @@ impl EmbedderMethods for ServoEmbedderCallbacks {
             }
         }
 
-        let discovery = webxr::openxr::OpenXrDiscovery::new(
-            Box::new(GlThread(executor)),
-            Box::new(ProviderRegistration(surface_providers)),
-        );
-        registry.register(discovery);
+        if openxr::create_instance(false).is_ok() {
+            let discovery = openxr::OpenXrDiscovery::new(
+                Box::new(GlThread(executor)),
+                Box::new(ProviderRegistration(surface_providers)),
+                Box::new(ContextMenuCallback(embedder_proxy)),
+            );
+            registry.register(discovery);
+        } else {
+            let msg =
+                "Cannot initialize OpenXR - please ensure runtime is installed and enabled in \
+                       the OpenXR developer portal app.\n\nImmersive mode will not function until \
+                       this error is fixed.";
+            let (sender, _receiver) = ipc::channel().unwrap();
+            embedder_proxy.send((
+                None,
+                EmbedderMsg::Prompt(
+                    PromptDefinition::Alert(msg.to_owned(), sender),
+                    PromptOrigin::Trusted,
+                ),
+            ));
+        }
     }
 
     #[cfg(not(feature = "uwp"))]
@@ -774,6 +852,7 @@ impl EmbedderMethods for ServoEmbedderCallbacks {
         registry: &mut webxr::MainThreadRegistry,
         _executor: WebGlExecutor,
         _surface_provider_registration: SurfaceProviders,
+        _embedder_proxy: EmbedderProxy,
     ) {
         debug!("EmbedderMethods::register_xr");
         if let Some(discovery) = self.xr_discovery.take() {
@@ -788,19 +867,8 @@ impl EmbedderMethods for ServoEmbedderCallbacks {
 }
 
 impl WindowMethods for ServoWindowCallbacks {
-    fn make_gl_context_current(&self) {
-        debug!("WindowMethods::prepare_for_composite");
-        self.host_callbacks.make_current();
-    }
-
-    fn present(&self) {
-        debug!("WindowMethods::present");
-        self.host_callbacks.flush();
-    }
-
-    fn gl(&self) -> Rc<dyn gl::Gl> {
-        debug!("WindowMethods::gl");
-        self.gl.clone()
+    fn webrender_surfman(&self) -> WebrenderSurfman {
+        self.webrender_surfman.clone()
     }
 
     fn set_animation_state(&self, state: AnimationState) {
@@ -885,4 +953,14 @@ impl ResourceReaderMethods for ResourceReaderInstance {
     fn sandbox_access_files_dirs(&self) -> Vec<PathBuf> {
         vec![]
     }
+}
+
+#[cfg(feature = "uwp")]
+fn create_adapter() -> Option<Adapter> {
+    webxr::openxr::create_surfman_adapter()
+}
+
+#[cfg(not(feature = "uwp"))]
+fn create_adapter() -> Option<Adapter> {
+    None
 }

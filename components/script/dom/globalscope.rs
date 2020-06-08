@@ -5,6 +5,9 @@
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::BroadcastChannelBinding::BroadcastChannelMethods;
 use crate::dom::bindings::codegen::Bindings::EventSourceBinding::EventSourceBinding::EventSourceMethods;
+use crate::dom::bindings::codegen::Bindings::ImageBitmapBinding::{
+    ImageBitmapOptions, ImageBitmapSource,
+};
 use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::PermissionState;
 use crate::dom::bindings::codegen::Bindings::VoidFunctionBinding::VoidFunction;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
@@ -23,7 +26,9 @@ use crate::dom::bindings::weakref::{DOMTracker, WeakRef};
 use crate::dom::blob::Blob;
 use crate::dom::broadcastchannel::BroadcastChannel;
 use crate::dom::crypto::Crypto;
-use crate::dom::dedicatedworkerglobalscope::DedicatedWorkerGlobalScope;
+use crate::dom::dedicatedworkerglobalscope::{
+    DedicatedWorkerControlMsg, DedicatedWorkerGlobalScope,
+};
 use crate::dom::errorevent::ErrorEvent;
 use crate::dom::event::{Event, EventBubbles, EventCancelable, EventStatus};
 use crate::dom::eventsource::EventSource;
@@ -31,17 +36,21 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::file::File;
 use crate::dom::htmlscriptelement::ScriptId;
 use crate::dom::identityhub::Identities;
+use crate::dom::imagebitmap::ImageBitmap;
 use crate::dom::messageevent::MessageEvent;
 use crate::dom::messageport::MessagePort;
 use crate::dom::paintworkletglobalscope::PaintWorkletGlobalScope;
 use crate::dom::performance::Performance;
 use crate::dom::performanceobserver::VALID_ENTRY_TYPES;
 use crate::dom::promise::Promise;
+use crate::dom::readablestream::{ExternalUnderlyingSource, ReadableStream};
+use crate::dom::serviceworker::ServiceWorker;
+use crate::dom::serviceworkerregistration::ServiceWorkerRegistration;
 use crate::dom::window::Window;
 use crate::dom::workerglobalscope::WorkerGlobalScope;
 use crate::dom::workletglobalscope::WorkletGlobalScope;
 use crate::microtask::{Microtask, MicrotaskQueue, UserMicrotask};
-use crate::realms::{enter_realm, InRealm};
+use crate::realms::{enter_realm, AlreadyInRealm, InRealm};
 use crate::script_module::ModuleTree;
 use crate::script_runtime::{CommonScriptMsg, JSContext as SafeJSContext, ScriptChan, ScriptPort};
 use crate::script_thread::{MainThreadScriptChan, ScriptThread};
@@ -59,6 +68,7 @@ use crate::task_source::TaskSourceName;
 use crate::timers::{IsInterval, OneshotTimerCallback, OneshotTimerHandle};
 use crate::timers::{OneshotTimers, TimerCallback};
 use content_security_policy::CspList;
+use crossbeam_channel::Sender;
 use devtools_traits::{PageError, ScriptToDevtoolsControlMsg};
 use dom_struct::dom_struct;
 use embedder_traits::EmbedderMsg;
@@ -67,22 +77,26 @@ use ipc_channel::router::ROUTER;
 use js::glue::{IsWrapper, UnwrapObjectDynamic};
 use js::jsapi::{CurrentGlobalOrNull, GetNonCCWObjectGlobal};
 use js::jsapi::{HandleObject, Heap};
-use js::jsapi::{JSContext, JSObject, SourceText};
+use js::jsapi::{JSContext, JSObject};
 use js::jsval::{JSVal, UndefinedValue};
 use js::panic::maybe_resume_unwind;
+use js::rust::transform_str_to_source_text;
 use js::rust::wrappers::Evaluate2;
 use js::rust::{get_object_class, CompileOptionsWrapper, ParentRuntime, Runtime};
 use js::rust::{HandleValue, MutableHandleValue};
 use js::{JSCLASS_IS_DOMJSCLASS, JSCLASS_IS_GLOBAL};
 use msg::constellation_msg::{
     BlobId, BroadcastChannelRouterId, MessagePortId, MessagePortRouterId, PipelineId,
+    ServiceWorkerId, ServiceWorkerRegistrationId,
 };
 use net_traits::blob_url_store::{get_blob_origin, BlobBuf};
 use net_traits::filemanager_thread::{
     FileManagerResult, FileManagerThreadMsg, ReadFileProgress, RelativePos,
 };
 use net_traits::image_cache::ImageCache;
+use net_traits::response::HttpsState;
 use net_traits::{CoreResourceMsg, CoreResourceThread, IpcSend, ResourceThreads};
+use parking_lot::Mutex;
 use profile_traits::{ipc as profile_ipc, mem as profile_mem, time as profile_time};
 use script_traits::serializable::{BlobData, BlobImpl, FileBlob};
 use script_traits::transferable::MessagePortImpl;
@@ -93,25 +107,55 @@ use script_traits::{
 use script_traits::{TimerEventId, TimerSchedulerMsg, TimerSource};
 use servo_url::{MutableOrigin, ServoUrl};
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell, RefMut};
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
-use std::marker::PhantomData;
 use std::mem;
 use std::ops::Index;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use time::{get_time, Timespec};
 use uuid::Uuid;
 
 #[derive(JSTraceable)]
-pub struct AutoCloseWorker(Arc<AtomicBool>);
+pub struct AutoCloseWorker {
+    /// https://html.spec.whatwg.org/multipage/#dom-workerglobalscope-closing
+    closing: Arc<AtomicBool>,
+    /// A handle to join on the worker thread.
+    join_handle: Option<JoinHandle<()>>,
+    /// A sender of control messages,
+    /// currently only used to signal shutdown.
+    control_sender: Sender<DedicatedWorkerControlMsg>,
+}
 
 impl Drop for AutoCloseWorker {
+    /// <https://html.spec.whatwg.org/multipage/#terminate-a-worker>
     fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
+        // Step 1.
+        self.closing.store(true, Ordering::SeqCst);
+
+        if self
+            .control_sender
+            .send(DedicatedWorkerControlMsg::Exit)
+            .is_err()
+        {
+            warn!("Couldn't send an exit message to a dedicated worker.");
+        }
+
+        // TODO: step 2 and 3.
+        // Step 4 is unnecessary since we don't use actual ports for dedicated workers.
+        if self
+            .join_handle
+            .take()
+            .expect("No handle to join on worker.")
+            .join()
+            .is_err()
+        {
+            warn!("Failed to join on dedicated worker thread.");
+        }
     }
 }
 
@@ -128,6 +172,13 @@ pub struct GlobalScope {
 
     /// The blobs managed by this global, if any.
     blob_state: DomRefCell<BlobState>,
+
+    /// <https://w3c.github.io/ServiceWorker/#environment-settings-object-service-worker-registration-object-map>
+    registration_map:
+        DomRefCell<HashMap<ServiceWorkerRegistrationId, Dom<ServiceWorkerRegistration>>>,
+
+    /// <https://w3c.github.io/ServiceWorker/#environment-settings-object-service-worker-object-map>
+    worker_map: DomRefCell<HashMap<ServiceWorkerId, Dom<ServiceWorker>>>,
 
     /// Pipeline id associated with this global.
     pipeline_id: PipelineId,
@@ -228,11 +279,14 @@ pub struct GlobalScope {
     user_agent: Cow<'static, str>,
 
     #[ignore_malloc_size_of = "defined in wgpu"]
-    gpu_id_hub: RefCell<Identities>,
+    gpu_id_hub: Arc<Mutex<Identities>>,
 
     // https://w3c.github.io/performance-timeline/#supportedentrytypes-attribute
     #[ignore_malloc_size_of = "mozjs"]
     frozen_supported_performance_entry_types: DomRefCell<Option<Heap<JSVal>>>,
+
+    /// currect https state (from previous request)
+    https_state: Cell<HttpsState>,
 }
 
 /// A wrapper for glue-code between the ipc router and the event-loop.
@@ -266,11 +320,19 @@ struct FileListener {
     task_canceller: TaskCanceller,
 }
 
-struct FileListenerCallback(Box<dyn Fn(Rc<Promise>, Result<Vec<u8>, Error>) + Send>);
+enum FileListenerCallback {
+    Promise(Box<dyn Fn(Rc<Promise>, Result<Vec<u8>, Error>) + Send>),
+    Stream,
+}
+
+enum FileListenerTarget {
+    Promise(TrustedPromise),
+    Stream(Trusted<ReadableStream>),
+}
 
 enum FileListenerState {
-    Empty(FileListenerCallback, TrustedPromise),
-    Receiving(Vec<u8>, FileListenerCallback, TrustedPromise),
+    Empty(FileListenerCallback, FileListenerTarget),
+    Receiving(Vec<u8>, FileListenerCallback, FileListenerTarget),
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -301,6 +363,14 @@ pub enum BlobState {
     Managed(HashMap<BlobId, BlobInfo>),
     /// This global is not managing any blobs at this time.
     UnManaged,
+}
+
+/// The result of looking-up the data for a Blob,
+/// containing either the in-memory bytes,
+/// or the file-id.
+enum BlobResult {
+    Bytes(Vec<u8>),
+    File(Uuid, usize),
 }
 
 /// Data representing a message-port managed by this global.
@@ -479,57 +549,137 @@ impl MessageListener {
     }
 }
 
+/// Callback used to enqueue file chunks to streams as part of FileListener.
+fn stream_handle_incoming(stream: &ReadableStream, bytes: Result<Vec<u8>, Error>) {
+    match bytes {
+        Ok(b) => {
+            stream.enqueue_native(b);
+        },
+        Err(e) => {
+            stream.error_native(e);
+        },
+    }
+}
+
+/// Callback used to close streams as part of FileListener.
+fn stream_handle_eof(stream: &ReadableStream) {
+    stream.close_native();
+}
+
 impl FileListener {
     fn handle(&mut self, msg: FileManagerResult<ReadFileProgress>) {
         match msg {
             Ok(ReadFileProgress::Meta(blob_buf)) => match self.state.take() {
-                Some(FileListenerState::Empty(callback, promise)) => {
-                    self.state = Some(FileListenerState::Receiving(
-                        blob_buf.bytes,
-                        callback,
-                        promise,
-                    ));
+                Some(FileListenerState::Empty(callback, target)) => {
+                    let bytes = if let FileListenerTarget::Stream(ref trusted_stream) = target {
+                        let trusted = trusted_stream.clone();
+
+                        let task = task!(enqueue_stream_chunk: move || {
+                            let stream = trusted.root();
+                            stream_handle_incoming(&*stream, Ok(blob_buf.bytes));
+                        });
+
+                        let _ = self
+                            .task_source
+                            .queue_with_canceller(task, &self.task_canceller);
+                        Vec::with_capacity(0)
+                    } else {
+                        blob_buf.bytes
+                    };
+
+                    self.state = Some(FileListenerState::Receiving(bytes, callback, target));
                 },
                 _ => panic!(
                     "Unexpected FileListenerState when receiving ReadFileProgress::Meta msg."
                 ),
             },
             Ok(ReadFileProgress::Partial(mut bytes_in)) => match self.state.take() {
-                Some(FileListenerState::Receiving(mut bytes, callback, promise)) => {
-                    bytes.append(&mut bytes_in);
-                    self.state = Some(FileListenerState::Receiving(bytes, callback, promise));
+                Some(FileListenerState::Receiving(mut bytes, callback, target)) => {
+                    if let FileListenerTarget::Stream(ref trusted_stream) = target {
+                        let trusted = trusted_stream.clone();
+
+                        let task = task!(enqueue_stream_chunk: move || {
+                            let stream = trusted.root();
+                            stream_handle_incoming(&*stream, Ok(bytes_in));
+                        });
+
+                        let _ = self
+                            .task_source
+                            .queue_with_canceller(task, &self.task_canceller);
+                    } else {
+                        bytes.append(&mut bytes_in);
+                    };
+
+                    self.state = Some(FileListenerState::Receiving(bytes, callback, target));
                 },
                 _ => panic!(
                     "Unexpected FileListenerState when receiving ReadFileProgress::Partial msg."
                 ),
             },
             Ok(ReadFileProgress::EOF) => match self.state.take() {
-                Some(FileListenerState::Receiving(bytes, callback, trusted_promise)) => {
-                    let _ = self.task_source.queue_with_canceller(
-                        task!(resolve_promise: move || {
+                Some(FileListenerState::Receiving(bytes, callback, target)) => match target {
+                    FileListenerTarget::Promise(trusted_promise) => {
+                        let callback = match callback {
+                            FileListenerCallback::Promise(callback) => callback,
+                            _ => panic!("Expected promise callback."),
+                        };
+                        let task = task!(resolve_promise: move || {
                             let promise = trusted_promise.root();
                             let _ac = enter_realm(&*promise.global());
-                            callback.0(promise, Ok(bytes));
-                        }),
-                        &self.task_canceller,
-                    );
+                            callback(promise, Ok(bytes));
+                        });
+
+                        let _ = self
+                            .task_source
+                            .queue_with_canceller(task, &self.task_canceller);
+                    },
+                    FileListenerTarget::Stream(trusted_stream) => {
+                        let trusted = trusted_stream.clone();
+
+                        let task = task!(enqueue_stream_chunk: move || {
+                            let stream = trusted.root();
+                            stream_handle_eof(&*stream);
+                        });
+
+                        let _ = self
+                            .task_source
+                            .queue_with_canceller(task, &self.task_canceller);
+                    },
                 },
                 _ => {
                     panic!("Unexpected FileListenerState when receiving ReadFileProgress::EOF msg.")
                 },
             },
             Err(_) => match self.state.take() {
-                Some(FileListenerState::Receiving(_, callback, trusted_promise)) |
-                Some(FileListenerState::Empty(callback, trusted_promise)) => {
-                    let bytes = Err(Error::Network);
-                    let _ = self.task_source.queue_with_canceller(
-                        task!(reject_promise: move || {
-                            let promise = trusted_promise.root();
-                            let _ac = enter_realm(&*promise.global());
-                            callback.0(promise, bytes);
-                        }),
-                        &self.task_canceller,
-                    );
+                Some(FileListenerState::Receiving(_, callback, target)) |
+                Some(FileListenerState::Empty(callback, target)) => {
+                    let error = Err(Error::Network);
+
+                    match target {
+                        FileListenerTarget::Promise(trusted_promise) => {
+                            let callback = match callback {
+                                FileListenerCallback::Promise(callback) => callback,
+                                _ => panic!("Expected promise callback."),
+                            };
+                            let _ = self.task_source.queue_with_canceller(
+                                task!(reject_promise: move || {
+                                    let promise = trusted_promise.root();
+                                    let _ac = enter_realm(&*promise.global());
+                                    callback(promise, error);
+                                }),
+                                &self.task_canceller,
+                            );
+                        },
+                        FileListenerTarget::Stream(trusted_stream) => {
+                            let _ = self.task_source.queue_with_canceller(
+                                task!(error_stream: move || {
+                                    let stream = trusted_stream.root();
+                                    stream_handle_incoming(&*stream, error);
+                                }),
+                                &self.task_canceller,
+                            );
+                        },
+                    }
                 },
                 _ => panic!("Unexpected FileListenerState when receiving Err msg."),
             },
@@ -550,6 +700,7 @@ impl GlobalScope {
         microtask_queue: Rc<MicrotaskQueue>,
         is_headless: bool,
         user_agent: Cow<'static, str>,
+        gpu_id_hub: Arc<Mutex<Identities>>,
     ) -> Self {
         Self {
             message_port_state: DomRefCell::new(MessagePortState::UnManaged),
@@ -557,6 +708,8 @@ impl GlobalScope {
             blob_state: DomRefCell::new(BlobState::UnManaged),
             eventtarget: EventTarget::new_inherited(),
             crypto: Default::default(),
+            registration_map: DomRefCell::new(HashMap::new()),
+            worker_map: DomRefCell::new(HashMap::new()),
             pipeline_id,
             devtools_wants_updates: Default::default(),
             console_timers: DomRefCell::new(Default::default()),
@@ -580,8 +733,9 @@ impl GlobalScope {
             consumed_rejections: Default::default(),
             is_headless,
             user_agent,
-            gpu_id_hub: RefCell::new(Identities::new()),
+            gpu_id_hub,
             frozen_supported_performance_entry_types: DomRefCell::new(Default::default()),
+            https_state: Cell::new(HttpsState::None),
         }
     }
 
@@ -634,6 +788,72 @@ impl GlobalScope {
         );
     }
 
+    /// <https://w3c.github.io/ServiceWorker/#get-the-service-worker-registration-object>
+    pub fn get_serviceworker_registration(
+        &self,
+        script_url: &ServoUrl,
+        scope: &ServoUrl,
+        registration_id: ServiceWorkerRegistrationId,
+        installing_worker: Option<ServiceWorkerId>,
+        _waiting_worker: Option<ServiceWorkerId>,
+        _active_worker: Option<ServiceWorkerId>,
+    ) -> DomRoot<ServiceWorkerRegistration> {
+        // Step 1
+        let mut registrations = self.registration_map.borrow_mut();
+
+        if let Some(registration) = registrations.get(&registration_id) {
+            // Step 3
+            return DomRoot::from_ref(&**registration);
+        }
+
+        // Step 2.1 -> 2.5
+        let new_registration =
+            ServiceWorkerRegistration::new(self, scope.clone(), registration_id.clone());
+
+        // Step 2.6
+        if let Some(worker_id) = installing_worker {
+            let worker = self.get_serviceworker(script_url, scope, worker_id);
+            new_registration.set_installing(&*worker);
+        }
+
+        // TODO: 2.7 (waiting worker)
+
+        // TODO: 2.8 (active worker)
+
+        // Step 2.9
+        registrations.insert(registration_id, Dom::from_ref(&*new_registration));
+
+        // Step 3
+        new_registration
+    }
+
+    /// <https://w3c.github.io/ServiceWorker/#get-the-service-worker-object>
+    pub fn get_serviceworker(
+        &self,
+        script_url: &ServoUrl,
+        scope: &ServoUrl,
+        worker_id: ServiceWorkerId,
+    ) -> DomRoot<ServiceWorker> {
+        // Step 1
+        let mut workers = self.worker_map.borrow_mut();
+
+        if let Some(worker) = workers.get(&worker_id) {
+            // Step 3
+            DomRoot::from_ref(&**worker)
+        } else {
+            // Step 2.1
+            // TODO: step 2.2, worker state.
+            let new_worker =
+                ServiceWorker::new(self, script_url.clone(), scope.clone(), worker_id.clone());
+
+            // Step 2.3
+            workers.insert(worker_id, Dom::from_ref(&*new_worker));
+
+            // Step 3
+            new_worker
+        }
+    }
+
     /// Complete the transfer of a message-port.
     fn complete_port_transfer(&self, port_id: MessagePortId, tasks: VecDeque<PortMessageTask>) {
         let should_start = if let MessagePortState::Managed(_id, message_ports) =
@@ -671,9 +891,18 @@ impl GlobalScope {
     }
 
     /// Remove the routers for ports and broadcast-channels.
-    pub fn remove_web_messaging_infra(&self) {
+    /// Drain the list of workers.
+    pub fn remove_web_messaging_and_dedicated_workers_infra(&self) {
         self.remove_message_ports_router();
         self.remove_broadcast_channel_router();
+
+        // Drop each ref to a worker explicitly now,
+        // which will send a shutdown signal,
+        // and join on the worker thread.
+        self.list_auto_close_worker
+            .borrow_mut()
+            .drain(0..)
+            .for_each(|worker| drop(worker));
     }
 
     /// Update our state to un-managed,
@@ -1433,6 +1662,70 @@ impl GlobalScope {
         }
     }
 
+    /// Get a slice to the inner data of a Blob,
+    /// if it's a memory blob, or it's file-id and file-size otherwise.
+    ///
+    /// Note: this is almost a duplicate of `get_blob_bytes`,
+    /// tweaked for integration with streams.
+    /// TODO: merge with `get_blob_bytes` by way of broader integration with blob streams.
+    fn get_blob_bytes_or_file_id(&self, blob_id: &BlobId) -> BlobResult {
+        let parent = {
+            let blob_state = self.blob_state.borrow();
+            if let BlobState::Managed(blobs_map) = &*blob_state {
+                let blob_info = blobs_map
+                    .get(blob_id)
+                    .expect("get_blob_bytes_or_file_id for an unknown blob.");
+                match blob_info.blob_impl.blob_data() {
+                    BlobData::Sliced(ref parent, ref rel_pos) => {
+                        Some((parent.clone(), rel_pos.clone()))
+                    },
+                    _ => None,
+                }
+            } else {
+                panic!("get_blob_bytes_or_file_id called on a global not managing any blobs.");
+            }
+        };
+
+        match parent {
+            Some((parent_id, rel_pos)) => {
+                match self.get_blob_bytes_non_sliced_or_file_id(&parent_id) {
+                    BlobResult::Bytes(bytes) => {
+                        let range = rel_pos.to_abs_range(bytes.len());
+                        BlobResult::Bytes(bytes.index(range).to_vec())
+                    },
+                    res => res,
+                }
+            },
+            None => self.get_blob_bytes_non_sliced_or_file_id(blob_id),
+        }
+    }
+
+    /// Get bytes from a non-sliced blob if in memory, or it's file-id and file-size.
+    ///
+    /// Note: this is almost a duplicate of `get_blob_bytes_non_sliced`,
+    /// tweaked for integration with streams.
+    /// TODO: merge with `get_blob_bytes` by way of broader integration with blob streams.
+    fn get_blob_bytes_non_sliced_or_file_id(&self, blob_id: &BlobId) -> BlobResult {
+        let blob_state = self.blob_state.borrow();
+        if let BlobState::Managed(blobs_map) = &*blob_state {
+            let blob_info = blobs_map
+                .get(blob_id)
+                .expect("get_blob_bytes_non_sliced_or_file_id called for a unknown blob.");
+            match blob_info.blob_impl.blob_data() {
+                BlobData::File(ref f) => match f.get_cache() {
+                    Some(bytes) => BlobResult::Bytes(bytes.clone()),
+                    None => BlobResult::File(f.get_id(), f.get_size() as usize),
+                },
+                BlobData::Memory(ref s) => BlobResult::Bytes(s.clone()),
+                BlobData::Sliced(_, _) => panic!("This blob doesn't have a parent."),
+            }
+        } else {
+            panic!(
+                "get_blob_bytes_non_sliced_or_file_id called on a global not managing any blobs."
+            );
+        }
+    }
+
     /// Get a copy of the type_string of a blob.
     pub fn get_blob_type_string(&self, blob_id: &BlobId) -> String {
         let blob_state = self.blob_state.borrow();
@@ -1637,6 +1930,50 @@ impl GlobalScope {
         GlobalScope::read_msg(recv)
     }
 
+    /// <https://w3c.github.io/FileAPI/#blob-get-stream>
+    pub fn get_blob_stream(&self, blob_id: &BlobId) -> DomRoot<ReadableStream> {
+        let (file_id, size) = match self.get_blob_bytes_or_file_id(blob_id) {
+            BlobResult::Bytes(bytes) => {
+                // If we have all the bytes in memory, queue them and close the stream.
+                let stream = ReadableStream::new_from_bytes(self, bytes);
+                return stream;
+            },
+            BlobResult::File(id, size) => (id, size),
+        };
+
+        let stream = ReadableStream::new_with_external_underlying_source(
+            self,
+            ExternalUnderlyingSource::Blob(size as usize),
+        );
+
+        let recv = self.send_msg(file_id);
+
+        let trusted_stream = Trusted::new(&*stream.clone());
+        let task_canceller = self.task_canceller(TaskSourceName::FileReading);
+        let task_source = self.file_reading_task_source();
+
+        let mut file_listener = FileListener {
+            state: Some(FileListenerState::Empty(
+                FileListenerCallback::Stream,
+                FileListenerTarget::Stream(trusted_stream),
+            )),
+            task_source,
+            task_canceller,
+        };
+
+        ROUTER.add_route(
+            recv.to_opaque(),
+            Box::new(move |msg| {
+                file_listener.handle(
+                    msg.to()
+                        .expect("Deserialization of file listener msg failed."),
+                );
+            }),
+        );
+
+        stream
+    }
+
     pub fn read_file_async(
         &self,
         id: Uuid,
@@ -1651,8 +1988,8 @@ impl GlobalScope {
 
         let mut file_listener = FileListener {
             state: Some(FileListenerState::Empty(
-                FileListenerCallback(callback),
-                trusted_promise,
+                FileListenerCallback::Promise(callback),
+                FileListenerTarget::Promise(trusted_promise),
             )),
             task_source,
             task_canceller,
@@ -1705,10 +2042,19 @@ impl GlobalScope {
         &self.permission_state_invocation_results
     }
 
-    pub fn track_worker(&self, closing_worker: Arc<AtomicBool>) {
+    pub fn track_worker(
+        &self,
+        closing: Arc<AtomicBool>,
+        join_handle: JoinHandle<()>,
+        control_sender: Sender<DedicatedWorkerControlMsg>,
+    ) {
         self.list_auto_close_worker
             .borrow_mut()
-            .push(AutoCloseWorker(closing_worker));
+            .push(AutoCloseWorker {
+                closing,
+                join_handle: Some(join_handle),
+                control_sender: control_sender,
+            });
     }
 
     pub fn track_event_source(&self, event_source: &EventSource) {
@@ -1751,6 +2097,12 @@ impl GlobalScope {
         let global = CurrentGlobalOrNull(cx);
         assert!(!global.is_null());
         global_scope_from_global(global, cx)
+    }
+
+    /// Returns the global scope for the given SafeJSContext
+    #[allow(unsafe_code)]
+    pub fn from_safe_context(cx: SafeJSContext, realm: InRealm) -> DomRoot<Self> {
+        unsafe { Self::from_context(*cx, realm) }
     }
 
     /// Returns the global object of the realm that the given JS object
@@ -2166,12 +2518,7 @@ impl GlobalScope {
                     Evaluate2(
                         *cx,
                         options.ptr,
-                        &mut SourceText {
-                            units_: code.as_ptr() as *const _,
-                            length_: code.len() as u32,
-                            ownsUnits_: false,
-                            _phantom_0: PhantomData,
-                        },
+                        &mut transform_str_to_source_text(code),
                         rval,
                     )
                 };
@@ -2230,6 +2577,71 @@ impl GlobalScope {
             callback: callback,
             pipeline: self.pipeline_id(),
         }))
+    }
+
+    pub fn create_image_bitmap(
+        &self,
+        image: ImageBitmapSource,
+        options: &ImageBitmapOptions,
+    ) -> Rc<Promise> {
+        let in_realm_proof = AlreadyInRealm::assert(&self);
+        let p = Promise::new_in_current_realm(&self, InRealm::Already(&in_realm_proof));
+        if options.resizeWidth.map_or(false, |w| w == 0) {
+            p.reject_error(Error::InvalidState);
+            return p;
+        }
+
+        if options.resizeHeight.map_or(false, |w| w == 0) {
+            p.reject_error(Error::InvalidState);
+            return p;
+        }
+
+        let promise = match image {
+            ImageBitmapSource::HTMLCanvasElement(ref canvas) => {
+                // https://html.spec.whatwg.org/multipage/#check-the-usability-of-the-image-argument
+                if !canvas.is_valid() {
+                    p.reject_error(Error::InvalidState);
+                    return p;
+                }
+
+                if let Some((data, size)) = canvas.fetch_all_data() {
+                    let data = data
+                        .map(|data| data.to_vec())
+                        .unwrap_or_else(|| vec![0; size.area() as usize * 4]);
+
+                    let image_bitmap = ImageBitmap::new(&self, size.width, size.height).unwrap();
+
+                    image_bitmap.set_bitmap_data(data);
+                    image_bitmap.set_origin_clean(canvas.origin_is_clean());
+                    p.resolve_native(&(image_bitmap));
+                }
+                p
+            },
+            ImageBitmapSource::OffscreenCanvas(ref canvas) => {
+                // https://html.spec.whatwg.org/multipage/#check-the-usability-of-the-image-argument
+                if !canvas.is_valid() {
+                    p.reject_error(Error::InvalidState);
+                    return p;
+                }
+
+                if let Some((data, size)) = canvas.fetch_all_data() {
+                    let data = data
+                        .map(|data| data.to_vec())
+                        .unwrap_or_else(|| vec![0; size.area() as usize * 4]);
+
+                    let image_bitmap = ImageBitmap::new(&self, size.width, size.height).unwrap();
+                    image_bitmap.set_bitmap_data(data);
+                    image_bitmap.set_origin_clean(canvas.origin_is_clean());
+                    p.resolve_native(&(image_bitmap));
+                }
+                p
+            },
+            _ => {
+                p.reject_error(Error::NotSupported);
+                return p;
+            },
+        };
+        promise
     }
 
     pub fn fire_timer(&self, handle: TimerEventId) {
@@ -2437,6 +2849,14 @@ impl GlobalScope {
         self.user_agent.clone()
     }
 
+    pub fn get_https_state(&self) -> HttpsState {
+        self.https_state.get()
+    }
+
+    pub fn set_https_state(&self, https_state: HttpsState) {
+        self.https_state.set(https_state);
+    }
+
     /// https://www.w3.org/TR/CSP/#get-csp-of-object
     pub fn get_csp_list(&self) -> Option<CspList> {
         if let Some(window) = self.downcast::<Window>() {
@@ -2446,8 +2866,8 @@ impl GlobalScope {
         None
     }
 
-    pub fn wgpu_id_hub(&self) -> RefMut<Identities> {
-        self.gpu_id_hub.borrow_mut()
+    pub fn wgpu_id_hub(&self) -> Arc<Mutex<Identities>> {
+        self.gpu_id_hub.clone()
     }
 }
 

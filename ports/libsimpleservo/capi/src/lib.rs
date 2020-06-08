@@ -17,8 +17,8 @@ use env_logger;
 use log::LevelFilter;
 use simpleservo::{self, gl_glue, ServoGlue, SERVO};
 use simpleservo::{
-    Coordinates, EventLoopWaker, HostTrait, InitOptions, MediaSessionActionType,
-    MediaSessionPlaybackState, MouseButton, PromptResult, VRInitOptions,
+    ContextMenuResult, Coordinates, EventLoopWaker, HostTrait, InitOptions, MediaSessionActionType,
+    MediaSessionPlaybackState, MouseButton, PromptResult,
 };
 use std::ffi::{CStr, CString};
 #[cfg(target_os = "windows")]
@@ -27,17 +27,20 @@ use std::os::raw::{c_char, c_uint, c_void};
 use std::panic::{self, UnwindSafe};
 use std::slice;
 use std::str::FromStr;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 extern "C" fn default_panic_handler(msg: *const c_char) {
     let c_str: &CStr = unsafe { CStr::from_ptr(msg) };
     error!("{}", c_str.to_str().unwrap());
 }
 
+type LogHandlerFn = extern "C" fn(buffer: *const c_char, len: u32);
+
 lazy_static! {
     static ref ON_PANIC: RwLock<extern "C" fn(*const c_char)> = RwLock::new(default_panic_handler);
     static ref SERVO_VERSION: CString =
-        { CString::new(simpleservo::servo_version()).expect("Can't create string") };
+        CString::new(simpleservo::servo_version()).expect("Can't create string");
+    pub(crate) static ref OUTPUT_LOG_HANDLER: Mutex<Option<LogHandlerFn>> = Mutex::new(None);
 }
 
 #[no_mangle]
@@ -64,13 +67,13 @@ fn catch_any_panic<T, F: FnOnce() -> T + UnwindSafe>(function: F) -> T {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn redirect_stdout_stderr() -> Result<(), String> {
+fn redirect_stdout_stderr(_handler: LogHandlerFn) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn redirect_stdout_stderr() -> Result<(), String> {
-    do_redirect_stdout_stderr().map_err(|()| {
+fn redirect_stdout_stderr(handler: LogHandlerFn) -> Result<(), String> {
+    do_redirect_stdout_stderr(handler).map_err(|()| {
         format!("GetLastError() = {}", unsafe {
             winapi::um::errhandlingapi::GetLastError()
         })
@@ -83,10 +86,9 @@ fn redirect_stdout_stderr() -> Result<(), String> {
 // Return Value: Result<(), String>
 //              Ok() - stdout and stderr redirects.
 //              Err(str) - The Err value can contain the string value of GetLastError.
-fn do_redirect_stdout_stderr() -> Result<(), ()> {
+fn do_redirect_stdout_stderr(handler: LogHandlerFn) -> Result<(), ()> {
     use std::thread;
     use winapi::shared;
-    use winapi::um::debugapi;
     use winapi::um::handleapi;
     use winapi::um::minwinbase;
     use winapi::um::namedpipeapi;
@@ -163,24 +165,20 @@ fn do_redirect_stdout_stderr() -> Result<(), ()> {
         }
 
         // Spawn a thread.  The thread will redirect all STDOUT and STDERR messages
-        // to OutputDebugString()
-        let _handler = thread::spawn(move || {
-            loop {
-                let mut read_buf: [i8; BUF_LENGTH] = [0; BUF_LENGTH];
+        // to the provided handler function.
+        let _handler = thread::spawn(move || loop {
+            let mut read_buf: [i8; BUF_LENGTH] = [0; BUF_LENGTH];
 
-                let result = libc::read(
-                    h_read_pipe_fd,
-                    read_buf.as_mut_ptr() as *mut _,
-                    read_buf.len() as u32 - 1,
-                );
+            let result = libc::read(
+                h_read_pipe_fd,
+                read_buf.as_mut_ptr() as *mut _,
+                read_buf.len() as u32 - 1,
+            );
 
-                if result == -1 {
-                    break;
-                }
-
-                // Write to Debug port.
-                debugapi::OutputDebugStringA(read_buf.as_mut_ptr() as winnt::LPSTR);
+            if result == -1 {
+                break;
             }
+            handler(read_buf.as_ptr(), result as u32);
         });
     }
 
@@ -203,8 +201,6 @@ where
 /// Callback used by Servo internals
 #[repr(C)]
 pub struct CHostCallbacks {
-    pub flush: extern "C" fn(),
-    pub make_current: extern "C" fn(),
     pub on_load_started: extern "C" fn(),
     pub on_load_ended: extern "C" fn(),
     pub on_title_changed: extern "C" fn(title: *const c_char),
@@ -230,6 +226,9 @@ pub struct CHostCallbacks {
         trusted: bool,
     ) -> *const c_char,
     pub on_devtools_started: extern "C" fn(result: CDevtoolsServerState, port: c_uint),
+    pub show_context_menu:
+        extern "C" fn(title: *const c_char, items_list: *const *const c_char, items_size: u32),
+    pub on_log_output: extern "C" fn(buffer: *const c_char, buffer_length: u32),
 }
 
 /// Servo options
@@ -240,10 +239,10 @@ pub struct CInitOptions {
     pub width: i32,
     pub height: i32,
     pub density: f32,
-    pub vr_pointer: *mut c_void,
     pub enable_subpixel_text_antialiasing: bool,
     pub vslogger_mod_list: *const *const c_char,
     pub vslogger_mod_size: u32,
+    pub native_widget: *mut c_void,
 }
 
 #[repr(C)]
@@ -332,6 +331,25 @@ impl CMediaSessionActionType {
     }
 }
 
+#[repr(C)]
+pub enum CContextMenuResult {
+    Ignored,
+    Selected,
+    // Can't use Dismissed. Already used by PromptResult. See:
+    // https://github.com/servo/servo/issues/25986
+    Dismiss,
+}
+
+impl CContextMenuResult {
+    pub fn convert(&self, idx: u32) -> ContextMenuResult {
+        match self {
+            CContextMenuResult::Ignored => ContextMenuResult::Ignored,
+            CContextMenuResult::Dismiss => ContextMenuResult::Dismissed,
+            CContextMenuResult::Selected => ContextMenuResult::Selected(idx as usize),
+        }
+    }
+}
+
 /// The returned string is not freed. This will leak.
 #[no_mangle]
 pub extern "C" fn servo_version() -> *const c_char {
@@ -402,9 +420,10 @@ unsafe fn init(
         slice::from_raw_parts(opts.vslogger_mod_list, opts.vslogger_mod_size as usize)
     };
 
+    *OUTPUT_LOG_HANDLER.lock().unwrap() = Some(callbacks.on_log_output);
     init_logger(logger_modules, logger_level);
 
-    if let Err(reason) = redirect_stdout_stderr() {
+    if let Err(reason) = redirect_stdout_stderr(callbacks.on_log_output) {
         warn!("Error redirecting stdout/stderr: {}", reason);
     }
 
@@ -418,15 +437,11 @@ unsafe fn init(
         url,
         coordinates,
         density: opts.density,
-        vr_init: if opts.vr_pointer.is_null() {
-            VRInitOptions::None
-        } else {
-            VRInitOptions::VRExternal(opts.vr_pointer)
-        },
         xr_discovery: None,
         enable_subpixel_text_antialiasing: opts.enable_subpixel_text_antialiasing,
         gl_context_pointer: gl_context,
         native_display_pointer: display,
+        native_widget: opts.native_widget,
     };
 
     let wakeup = Box::new(WakeupCallback::new(wakeup));
@@ -491,6 +506,14 @@ pub extern "C" fn set_batch_mode(batch: bool) {
     catch_any_panic(|| {
         debug!("set_batch_mode");
         call(|s| s.set_batch_mode(batch));
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn on_context_menu_closed(result: CContextMenuResult, item: u32) {
+    catch_any_panic(|| {
+        debug!("on_context_menu_closed");
+        call(|s| s.on_context_menu_closed(result.convert(item)));
     });
 }
 
@@ -727,16 +750,6 @@ impl HostCallbacks {
 }
 
 impl HostTrait for HostCallbacks {
-    fn flush(&self) {
-        debug!("flush");
-        (self.0.flush)();
-    }
-
-    fn make_current(&self) {
-        debug!("make_current");
-        (self.0.make_current)();
-    }
-
     fn on_load_started(&self) {
         debug!("on_load_started");
         (self.0.on_load_started)();
@@ -873,5 +886,21 @@ impl HostTrait for HostCallbacks {
                 (self.0.on_devtools_started)(CDevtoolsServerState::Error, 0);
             },
         }
+    }
+
+    fn show_context_menu(&self, title: Option<String>, items: Vec<String>) {
+        debug!("show_context_menu");
+        let items_size = items.len() as u32;
+        let cstrs: Vec<CString> = items
+            .into_iter()
+            .map(|i| CString::new(i).expect("Can't create string"))
+            .collect();
+        let items: Vec<*const c_char> = cstrs.iter().map(|cstr| cstr.as_ptr()).collect();
+        let title = title.map(|s| CString::new(s).expect("Can't create string"));
+        let title_ptr = title
+            .as_ref()
+            .map(|cstr| cstr.as_ptr())
+            .unwrap_or(std::ptr::null());
+        (self.0.show_context_menu)(title_ptr, items.as_ptr(), items_size);
     }
 }

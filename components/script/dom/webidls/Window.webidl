@@ -40,8 +40,8 @@
   // https://github.com/whatwg/html/issues/2115
   [Replaceable] readonly attribute WindowProxy? parent;
   readonly attribute Element? frameElement;
-  WindowProxy? open(optional USVString url = "", optional DOMString target = "_blank",
-                    optional DOMString features = "");
+  [Throws] WindowProxy? open(optional USVString url = "", optional DOMString target = "_blank",
+                             optional DOMString features = "");
   //getter WindowProxy (unsigned long index);
 
   // https://github.com/servo/servo/issues/14453
@@ -180,6 +180,10 @@ partial interface Window {
    Selection? getSelection();
 };
 
+// https://dom.spec.whatwg.org/#interface-window-extensions
+partial interface Window {
+  [Replaceable] readonly attribute any event; // historical
+};
 
 dictionary WindowPostMessageOptions : PostMessageOptions {
    USVString targetOrigin = "/";

@@ -10,5 +10,6 @@ interface XRFrame {
 
   [Throws] XRViewerPose? getViewerPose(XRReferenceSpace referenceSpace);
   [Throws] XRPose? getPose(XRSpace space, XRSpace relativeTo);
-  // XRInputPose? getInputPose(XRInputSource inputSource, optional XRReferenceSpace referenceSpace);
+  [Pref="dom.webxr.hands.enabled", Throws] XRJointPose? getJointPose(XRJointSpace space, XRSpace relativeTo);
+  sequence<XRHitTestResult> getHitTestResults(XRHitTestSource hitTestSource);
 };

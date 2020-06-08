@@ -3,28 +3,34 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use crate::rpc::LayoutRPC;
-use crate::{OpaqueStyleAndLayoutData, PendingImage, TrustedNodeAddress};
+use crate::{PendingImage, TrustedNodeAddress};
 use app_units::Au;
 use crossbeam_channel::{Receiver, Sender};
 use euclid::default::{Point2D, Rect};
+use fxhash::FxHashMap;
 use gfx_traits::Epoch;
 use ipc_channel::ipc::{IpcReceiver, IpcSender};
 use metrics::PaintTimeMetrics;
 use msg::constellation_msg::{BackgroundHangMonitorRegister, BrowsingContextId, PipelineId};
 use net_traits::image_cache::ImageCache;
+use parking_lot::RwLock;
 use profile_traits::mem::ReportsChan;
 use script_traits::Painter;
-use script_traits::{ConstellationControlMsg, LayoutControlMsg, LayoutMsg as ConstellationMsg};
-use script_traits::{ScrollState, UntrustedNodeAddress, WindowSizeData};
+use script_traits::{
+    ConstellationControlMsg, LayoutControlMsg, LayoutMsg as ConstellationMsg, ScrollState,
+    WindowSizeData,
+};
 use servo_arc::Arc as ServoArc;
 use servo_atoms::Atom;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use style::animation::ElementAnimationSet;
 use style::context::QuirksMode;
 use style::dom::OpaqueNode;
+use style::invalidation::element::restyle_hints::RestyleHint;
 use style::properties::PropertyId;
-use style::selector_parser::PseudoElement;
+use style::selector_parser::{PseudoElement, RestyleDamage, Snapshot};
 use style::stylesheets::Stylesheet;
 
 /// Asynchronous messages that script can send to layout.
@@ -45,20 +51,6 @@ pub enum Msg {
 
     /// Get an RPC interface.
     GetRPC(Sender<Box<dyn LayoutRPC + Send>>),
-
-    /// Requests that the layout thread render the next frame of all animations.
-    TickAnimations(ImmutableOrigin),
-
-    /// Updates layout's timer for animation testing from script.
-    ///
-    /// The inner field is the number of *milliseconds* to advance, and the bool
-    /// field is whether animations should be force-ticked.
-    AdvanceClockMs(i32, bool, ImmutableOrigin),
-
-    /// Destroys layout data associated with a DOM node.
-    ///
-    /// TODO(pcwalton): Maybe think about batching to avoid message traffic.
-    ReapStyleAndLayoutData(OpaqueStyleAndLayoutData),
 
     /// Requests that the layout thread measure its memory usage. The resulting reports are sent back
     /// via the supplied channel.
@@ -100,9 +92,6 @@ pub enum Msg {
 
     /// Send to layout the precise time when the navigation started.
     SetNavigationStart(u64),
-
-    /// Request the current number of animations that are running.
-    GetRunningAnimations(IpcSender<usize>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -126,7 +115,7 @@ pub enum QueryMsg {
     // garbage values such as `0xdeadbeef as *const _`, this is unsound.
     NodeScrollIdQuery(TrustedNodeAddress),
     ResolvedStyleQuery(TrustedNodeAddress, Option<PseudoElement>, PropertyId),
-    StyleQuery(TrustedNodeAddress),
+    StyleQuery,
     ElementInnerTextQuery(TrustedNodeAddress),
     InnerWindowDimensionsQuery(BrowsingContextId),
 }
@@ -157,7 +146,7 @@ impl ReflowGoal {
                 QueryMsg::NodeScrollIdQuery(_) |
                 QueryMsg::ResolvedStyleQuery(..) |
                 QueryMsg::OffsetParentQuery(_) |
-                QueryMsg::StyleQuery(_) => false,
+                QueryMsg::StyleQuery => false,
             },
         }
     }
@@ -179,7 +168,7 @@ impl ReflowGoal {
                 QueryMsg::ResolvedStyleQuery(..) |
                 QueryMsg::OffsetParentQuery(_) |
                 QueryMsg::InnerWindowDimensionsQuery(_) |
-                QueryMsg::StyleQuery(_) => false,
+                QueryMsg::StyleQuery => false,
             },
         }
     }
@@ -196,8 +185,6 @@ pub struct Reflow {
 pub struct ReflowComplete {
     /// The list of images that were encountered that are in progress.
     pub pending_images: Vec<PendingImage>,
-    /// The list of nodes that initiated a CSS transition.
-    pub newly_transitioning_nodes: Vec<UntrustedNodeAddress>,
 }
 
 /// Information needed for a script-initiated reflow.
@@ -206,6 +193,8 @@ pub struct ScriptReflow {
     pub reflow_info: Reflow,
     /// The document node.
     pub document: TrustedNodeAddress,
+    /// The dirty root from which to restyle.
+    pub dirty_root: Option<TrustedNodeAddress>,
     /// Whether the document's stylesheets have changed since the last script reflow.
     pub stylesheets_changed: bool,
     /// The current window size.
@@ -218,6 +207,12 @@ pub struct ScriptReflow {
     pub dom_count: u32,
     /// The current window origin
     pub origin: ImmutableOrigin,
+    /// Restyle snapshot map.
+    pub pending_restyles: Vec<(TrustedNodeAddress, PendingRestyle)>,
+    /// The current animation timeline value.
+    pub animation_timeline_value: f64,
+    /// The set of animations for this document.
+    pub animations: ServoArc<RwLock<FxHashMap<OpaqueNode, ElementAnimationSet>>>,
 }
 
 pub struct LayoutThreadInit {
@@ -233,4 +228,30 @@ pub struct LayoutThreadInit {
     pub paint_time_metrics: PaintTimeMetrics,
     pub layout_is_busy: Arc<AtomicBool>,
     pub window_size: WindowSizeData,
+}
+
+/// A pending restyle.
+#[derive(Debug, MallocSizeOf)]
+pub struct PendingRestyle {
+    /// If this element had a state or attribute change since the last restyle, track
+    /// the original condition of the element.
+    pub snapshot: Option<Snapshot>,
+
+    /// Any explicit restyles hints that have been accumulated for this element.
+    pub hint: RestyleHint,
+
+    /// Any explicit restyles damage that have been accumulated for this element.
+    pub damage: RestyleDamage,
+}
+
+impl PendingRestyle {
+    /// Creates a new empty pending restyle.
+    #[inline]
+    pub fn new() -> Self {
+        PendingRestyle {
+            snapshot: None,
+            hint: RestyleHint::empty(),
+            damage: RestyleDamage::empty(),
+        }
+    }
 }

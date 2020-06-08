@@ -16,8 +16,12 @@ use crate::dom::bindings::reflector::DomObject;
 use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
+use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlcanvaselement::HTMLCanvasElement;
-use crate::dom::htmliframeelement::HTMLIFrameElement;
+use crate::dom::webgl_validations::tex_image_2d::{
+    TexImage2DValidator, TexImage2DValidatorResult, TexStorageValidator, TexStorageValidatorResult,
+};
+use crate::dom::webgl_validations::WebGLValidator;
 use crate::dom::webglactiveinfo::WebGLActiveInfo;
 use crate::dom::webglbuffer::WebGLBuffer;
 use crate::dom::webglframebuffer::{WebGLFramebuffer, WebGLFramebufferAttachmentRoot};
@@ -25,8 +29,8 @@ use crate::dom::webglprogram::WebGLProgram;
 use crate::dom::webglquery::WebGLQuery;
 use crate::dom::webglrenderbuffer::WebGLRenderbuffer;
 use crate::dom::webglrenderingcontext::{
-    uniform_get, uniform_typed, LayoutCanvasWebGLRenderingContextHelpers, Size2DExt,
-    WebGLRenderingContext,
+    uniform_get, uniform_typed, LayoutCanvasWebGLRenderingContextHelpers, Operation, TexPixels,
+    VertexAttrib, WebGLRenderingContext,
 };
 use crate::dom::webglsampler::{WebGLSampler, WebGLSamplerValue};
 use crate::dom::webglshader::WebGLShader;
@@ -46,16 +50,18 @@ use canvas_traits::webgl::{
 };
 use dom_struct::dom_struct;
 use euclid::default::{Point2D, Rect, Size2D};
-use ipc_channel::ipc;
+use ipc_channel::ipc::{self, IpcSharedMemory};
 use js::jsapi::{JSObject, Type};
 use js::jsval::{BooleanValue, DoubleValue, Int32Value, UInt32Value};
 use js::jsval::{JSVal, NullValue, ObjectValue, UndefinedValue};
-use js::rust::CustomAutoRooterGuard;
+use js::rust::{CustomAutoRooterGuard, HandleObject};
 use js::typedarray::{ArrayBufferView, CreateWith, Float32, Int32Array, Uint32, Uint32Array};
 use script_layout_interface::HTMLCanvasDataSource;
+use servo_config::pref;
 use std::cell::Cell;
 use std::cmp;
 use std::ptr::{self, NonNull};
+use url::Host;
 
 #[unrooted_must_root_lint::must_root]
 #[derive(JSTraceable, MallocSizeOf)]
@@ -178,7 +184,25 @@ impl WebGL2RenderingContext {
         WebGL2RenderingContext::new_inherited(window, canvas, size, attrs)
             .map(|ctx| reflect_dom_object(Box::new(ctx), window))
     }
+
+    #[allow(unsafe_code)]
+    pub fn is_webgl2_enabled(_cx: JSContext, global: HandleObject) -> bool {
+        if pref!(dom.webgl2.enabled) {
+            return true;
+        }
+
+        let global = unsafe { GlobalScope::from_object(global.get()) };
+        let origin = global.origin();
+        let host = origin.host();
+        WEBGL2_ORIGINS
+            .iter()
+            .any(|origin| host == Host::parse(origin).ok().as_ref())
+    }
 }
+
+/// List of domains for which WebGL 2 is enabled automatically, regardless
+/// of the status of the dom.webgl2.enabled preference.
+static WEBGL2_ORIGINS: &[&str] = &["www.servoexperiments.com"];
 
 impl WebGL2RenderingContext {
     pub fn recreate(&self, size: Size2D<u32>) {
@@ -187,6 +211,104 @@ impl WebGL2RenderingContext {
 
     pub fn current_vao(&self) -> DomRoot<WebGLVertexArrayObject> {
         self.base.current_vao_webgl2()
+    }
+
+    pub fn validate_uniform_block_for_draw(&self) {
+        let program = match self.base.current_program() {
+            Some(program) => program,
+            None => return,
+        };
+        for uniform_block in program.active_uniform_blocks().iter() {
+            let data_size = uniform_block.size as usize;
+            for block in program.active_uniforms().iter() {
+                let index = match block.bind_index {
+                    Some(index) => index,
+                    None => continue,
+                };
+                let indexed = &self.indexed_uniform_buffer_bindings[index as usize];
+                let buffer = match indexed.buffer.get() {
+                    Some(buffer) => buffer,
+                    None => {
+                        self.base.webgl_error(InvalidOperation);
+                        return;
+                    },
+                };
+                if indexed.size.get() == 0 {
+                    if data_size > buffer.capacity() {
+                        self.base.webgl_error(InvalidOperation);
+                        return;
+                    }
+                } else {
+                    let start = indexed.start.get() as usize;
+                    let mut size = indexed.size.get() as usize;
+                    if start >= size {
+                        self.base.webgl_error(InvalidOperation);
+                        return;
+                    }
+                    size -= start;
+                    if data_size > size {
+                        self.base.webgl_error(InvalidOperation);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn validate_vertex_attribs_for_draw(&self) {
+        let program = match self.base.current_program() {
+            Some(program) => program,
+            None => return,
+        };
+        let groups = [
+            [
+                constants::INT,
+                constants::INT_VEC2,
+                constants::INT_VEC3,
+                constants::INT_VEC4,
+            ],
+            [
+                constants::UNSIGNED_INT,
+                constants::UNSIGNED_INT_VEC2,
+                constants::UNSIGNED_INT_VEC3,
+                constants::UNSIGNED_INT_VEC4,
+            ],
+            [
+                constants::FLOAT,
+                constants::FLOAT_VEC2,
+                constants::FLOAT_VEC3,
+                constants::FLOAT_VEC4,
+            ],
+        ];
+        let vao = self.current_vao();
+        for prog_attrib in program.active_attribs().iter() {
+            let attrib = handle_potential_webgl_error!(
+                self.base,
+                vao.get_vertex_attrib(prog_attrib.location as u32)
+                    .ok_or(InvalidOperation),
+                return
+            );
+
+            let current_vertex_attrib =
+                self.base.current_vertex_attribs()[prog_attrib.location as usize];
+            let attrib_data_base_type = if !attrib.enabled_as_array {
+                match current_vertex_attrib {
+                    VertexAttrib::Int(_, _, _, _) => constants::INT,
+                    VertexAttrib::Uint(_, _, _, _) => constants::UNSIGNED_INT,
+                    VertexAttrib::Float(_, _, _, _) => constants::FLOAT,
+                }
+            } else {
+                attrib.type_
+            };
+
+            let contains = groups
+                .iter()
+                .find(|g| g.contains(&attrib_data_base_type) && g.contains(&prog_attrib.type_));
+            if contains.is_none() {
+                self.base.webgl_error(InvalidOperation);
+                return;
+            }
+        }
     }
 
     pub fn base_context(&self) -> DomRoot<WebGLRenderingContext> {
@@ -220,7 +342,7 @@ impl WebGL2RenderingContext {
 
     fn unbind_from(&self, slot: &MutNullableDom<WebGLBuffer>, buffer: &WebGLBuffer) {
         if slot.get().map_or(false, |b| buffer == &*b) {
-            buffer.decrement_attached_counter();
+            buffer.decrement_attached_counter(Operation::Infallible);
             slot.set(None);
         }
     }
@@ -698,6 +820,77 @@ impl WebGL2RenderingContext {
 
         true
     }
+
+    fn vertex_attrib_i(&self, index: u32, x: i32, y: i32, z: i32, w: i32) {
+        if index >= self.base.limits().max_vertex_attribs {
+            return self.base.webgl_error(InvalidValue);
+        }
+        self.base.current_vertex_attribs()[index as usize] = VertexAttrib::Int(x, y, z, w);
+        self.current_vao()
+            .set_vertex_attrib_type(index, constants::INT);
+        self.base
+            .send_command(WebGLCommand::VertexAttribI(index, x, y, z, w));
+    }
+
+    fn vertex_attrib_u(&self, index: u32, x: u32, y: u32, z: u32, w: u32) {
+        if index >= self.base.limits().max_vertex_attribs {
+            return self.base.webgl_error(InvalidValue);
+        }
+        self.base.current_vertex_attribs()[index as usize] = VertexAttrib::Uint(x, y, z, w);
+        self.current_vao()
+            .set_vertex_attrib_type(index, constants::UNSIGNED_INT);
+        self.base
+            .send_command(WebGLCommand::VertexAttribU(index, x, y, z, w));
+    }
+
+    fn tex_storage(
+        &self,
+        dimensions: u8,
+        target: u32,
+        levels: i32,
+        internal_format: u32,
+        width: i32,
+        height: i32,
+        depth: i32,
+    ) {
+        let expected_dimensions = match target {
+            constants::TEXTURE_2D | constants::TEXTURE_CUBE_MAP => 2,
+            constants::TEXTURE_3D | constants::TEXTURE_2D_ARRAY => 3,
+            _ => return self.base.webgl_error(InvalidEnum),
+        };
+        if dimensions != expected_dimensions {
+            return self.base.webgl_error(InvalidEnum);
+        }
+
+        let validator = TexStorageValidator::new(
+            &self.base,
+            dimensions,
+            target,
+            levels,
+            internal_format,
+            width,
+            height,
+            depth,
+        );
+        let TexStorageValidatorResult {
+            texture,
+            target,
+            levels,
+            internal_format,
+            width,
+            height,
+            depth,
+        } = match validator.validate() {
+            Ok(result) => result,
+            Err(_) => return, // NB: The validator sets the correct error for us.
+        };
+
+        handle_potential_webgl_error!(
+            self.base,
+            texture.storage(target, levels, internal_format, width, height, depth),
+            return
+        );
+    }
 }
 
 impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
@@ -727,8 +920,10 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.5
-    fn GetBufferParameter(&self, cx: JSContext, target: u32, parameter: u32) -> JSVal {
-        self.base.GetBufferParameter(cx, target, parameter)
+    fn GetBufferParameter(&self, _cx: JSContext, target: u32, parameter: u32) -> JSVal {
+        let buffer =
+            handle_potential_webgl_error!(self.base, self.bound_buffer(target), return NullValue());
+        self.base.get_buffer_param(buffer, parameter)
     }
 
     #[allow(unsafe_code)]
@@ -746,9 +941,12 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
                 return rval.get();
             },
             constants::MAX_CLIENT_WAIT_TIMEOUT_WEBGL => {
-                return Int32Value(
-                    self.base.limits().max_client_wait_timeout_webgl.as_nanos() as i32
+                return DoubleValue(
+                    self.base.limits().max_client_wait_timeout_webgl.as_nanos() as f64
                 );
+            },
+            constants::MAX_SERVER_WAIT_TIMEOUT => {
+                return DoubleValue(self.base.limits().max_server_wait_timeout.as_nanos() as f64);
             },
             constants::SAMPLER_BINDING => unsafe {
                 let idx = (self.base.textures().active_unit_enum() - constants::TEXTURE0) as usize;
@@ -831,28 +1029,45 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
                 };
                 return UInt32Value(buffer);
             },
+            constants::MAX_TEXTURE_LOD_BIAS => {
+                return DoubleValue(self.base.limits().max_texture_lod_bias as f64)
+            },
+            constants::MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS => {
+                return DoubleValue(
+                    self.base.limits().max_combined_fragment_uniform_components as f64,
+                )
+            },
+            constants::MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS => {
+                return DoubleValue(
+                    self.base.limits().max_combined_vertex_uniform_components as f64,
+                )
+            },
+            constants::MAX_ELEMENT_INDEX => {
+                return DoubleValue(self.base.limits().max_element_index as f64)
+            },
+            constants::MAX_UNIFORM_BLOCK_SIZE => {
+                return DoubleValue(self.base.limits().max_uniform_block_size as f64)
+            },
+            constants::MIN_PROGRAM_TEXEL_OFFSET => {
+                return Int32Value(self.base.limits().min_program_texel_offset)
+            },
             _ => {},
         }
 
         let limit = match parameter {
-            constants::MAX_UNIFORM_BUFFER_BINDINGS => {
-                Some(self.base.limits().max_uniform_buffer_bindings)
+            constants::MAX_3D_TEXTURE_SIZE => Some(self.base.limits().max_3d_texture_size),
+            constants::MAX_ARRAY_TEXTURE_LAYERS => {
+                Some(self.base.limits().max_array_texture_layers)
             },
-            constants::MAX_UNIFORM_BLOCK_SIZE => Some(self.base.limits().max_uniform_block_size),
+            constants::MAX_COLOR_ATTACHMENTS => Some(self.base.limits().max_color_attachments),
             constants::MAX_COMBINED_UNIFORM_BLOCKS => {
                 Some(self.base.limits().max_combined_uniform_blocks)
             },
-            constants::MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS => {
-                Some(self.base.limits().max_combined_vertex_uniform_components)
-            },
-            constants::MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS => {
-                Some(self.base.limits().max_combined_fragment_uniform_components)
-            },
-            constants::MAX_VERTEX_UNIFORM_BLOCKS => {
-                Some(self.base.limits().max_vertex_uniform_blocks)
-            },
-            constants::MAX_VERTEX_UNIFORM_COMPONENTS => {
-                Some(self.base.limits().max_vertex_uniform_components)
+            constants::MAX_DRAW_BUFFERS => Some(self.base.limits().max_draw_buffers),
+            constants::MAX_ELEMENTS_INDICES => Some(self.base.limits().max_elements_indices),
+            constants::MAX_ELEMENTS_VERTICES => Some(self.base.limits().max_elements_vertices),
+            constants::MAX_FRAGMENT_INPUT_COMPONENTS => {
+                Some(self.base.limits().max_fragment_input_components)
             },
             constants::MAX_FRAGMENT_UNIFORM_BLOCKS => {
                 Some(self.base.limits().max_fragment_uniform_blocks)
@@ -860,11 +1075,26 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
             constants::MAX_FRAGMENT_UNIFORM_COMPONENTS => {
                 Some(self.base.limits().max_fragment_uniform_components)
             },
+            constants::MAX_PROGRAM_TEXEL_OFFSET => {
+                Some(self.base.limits().max_program_texel_offset)
+            },
+            constants::MAX_SAMPLES => Some(self.base.limits().max_samples),
+            constants::MAX_UNIFORM_BUFFER_BINDINGS => {
+                Some(self.base.limits().max_uniform_buffer_bindings)
+            },
+            constants::MAX_VARYING_COMPONENTS => Some(self.base.limits().max_varying_components),
+            constants::MAX_VERTEX_OUTPUT_COMPONENTS => {
+                Some(self.base.limits().max_vertex_output_components)
+            },
+            constants::MAX_VERTEX_UNIFORM_BLOCKS => {
+                Some(self.base.limits().max_vertex_uniform_blocks)
+            },
+            constants::MAX_VERTEX_UNIFORM_COMPONENTS => {
+                Some(self.base.limits().max_vertex_uniform_components)
+            },
             constants::UNIFORM_BUFFER_OFFSET_ALIGNMENT => {
                 Some(self.base.limits().uniform_buffer_offset_alignment)
             },
-            constants::MAX_COLOR_ATTACHMENTS => Some(self.base.limits().max_color_attachments),
-            constants::MAX_DRAW_BUFFERS => Some(self.base.limits().max_draw_buffers),
             _ => None,
         };
         if let Some(limit) = limit {
@@ -1052,7 +1282,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.5
-    fn BufferData(&self, target: u32, data: Option<ArrayBufferViewOrArrayBuffer>, usage: u32) {
+    fn BufferData_(&self, target: u32, data: Option<ArrayBufferViewOrArrayBuffer>, usage: u32) {
         let usage = handle_potential_webgl_error!(self.base, self.buffer_usage(usage), return);
         let bound_buffer =
             handle_potential_webgl_error!(self.base, self.bound_buffer(target), return);
@@ -1060,7 +1290,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.5
-    fn BufferData_(&self, target: u32, size: i64, usage: u32) {
+    fn BufferData(&self, target: u32, size: i64, usage: u32) {
         let usage = handle_potential_webgl_error!(self.base, self.buffer_usage(usage), return);
         let bound_buffer =
             handle_potential_webgl_error!(self.base, self.bound_buffer(target), return);
@@ -1284,7 +1514,8 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         }
     }
 
-    /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.8
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.6
+    #[allow(unsafe_code)]
     fn CompressedTexImage2D(
         &self,
         target: u32,
@@ -1294,19 +1525,32 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         height: i32,
         border: i32,
         pixels: CustomAutoRooterGuard<ArrayBufferView>,
+        src_offset: u32,
+        src_length_override: u32,
     ) {
-        self.base.CompressedTexImage2D(
+        let mut data = unsafe { pixels.as_slice() };
+        let start = src_offset as usize;
+        let end = (src_offset + src_length_override) as usize;
+        if start > data.len() || end > data.len() {
+            self.base.webgl_error(InvalidValue);
+            return;
+        }
+        if src_length_override != 0 {
+            data = &data[start..end];
+        }
+        self.base.compressed_tex_image_2d(
             target,
             level,
             internal_format,
             width,
             height,
             border,
-            pixels,
+            data,
         )
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.8
+    #[allow(unsafe_code)]
     fn CompressedTexSubImage2D(
         &self,
         target: u32,
@@ -1317,9 +1561,21 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         height: i32,
         format: u32,
         pixels: CustomAutoRooterGuard<ArrayBufferView>,
+        src_offset: u32,
+        src_length_override: u32,
     ) {
-        self.base.CompressedTexSubImage2D(
-            target, level, xoffset, yoffset, width, height, format, pixels,
+        let mut data = unsafe { pixels.as_slice() };
+        let start = src_offset as usize;
+        let end = (src_offset + src_length_override) as usize;
+        if start > data.len() || end > data.len() {
+            self.base.webgl_error(InvalidValue);
+            return;
+        }
+        if src_length_override != 0 {
+            data = &data[start..end];
+        }
+        self.base.compressed_tex_sub_image_2d(
+            target, level, xoffset, yoffset, width, height, format, data,
         )
     }
 
@@ -1492,7 +1748,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
             self.unbind_from(&binding.buffer, &buffer);
         }
 
-        buffer.mark_for_deletion(false);
+        buffer.mark_for_deletion(Operation::Infallible);
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.6
@@ -1527,11 +1783,15 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.11
     fn DrawArrays(&self, mode: u32, first: i32, count: i32) {
+        self.validate_uniform_block_for_draw();
+        self.validate_vertex_attribs_for_draw();
         self.base.DrawArrays(mode, first, count)
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.11
     fn DrawElements(&self, mode: u32, count: i32, type_: u32, offset: i64) {
+        self.validate_uniform_block_for_draw();
+        self.validate_vertex_attribs_for_draw();
         self.base.DrawElements(mode, count, type_, offset)
     }
 
@@ -1959,7 +2219,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         src_offset: u32,
         src_length: u32,
     ) {
-        self.base.Uniform1iv(location, v, src_offset, src_length)
+        self.base.uniform1iv(location, v, src_offset, src_length)
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.8
@@ -2021,7 +2281,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         src_offset: u32,
         src_length: u32,
     ) {
-        self.base.Uniform1fv(location, v, src_offset, src_length);
+        self.base.uniform1fv(location, v, src_offset, src_length);
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.10
@@ -2037,7 +2297,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         src_offset: u32,
         src_length: u32,
     ) {
-        self.base.Uniform2fv(location, v, src_offset, src_length);
+        self.base.uniform2fv(location, v, src_offset, src_length);
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.10
@@ -2053,7 +2313,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         src_offset: u32,
         src_length: u32,
     ) {
-        self.base.Uniform2iv(location, v, src_offset, src_length)
+        self.base.uniform2iv(location, v, src_offset, src_length)
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.8
@@ -2102,7 +2362,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         src_offset: u32,
         src_length: u32,
     ) {
-        self.base.Uniform3fv(location, v, src_offset, src_length);
+        self.base.uniform3fv(location, v, src_offset, src_length);
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.10
@@ -2118,7 +2378,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         src_offset: u32,
         src_length: u32,
     ) {
-        self.base.Uniform3iv(location, v, src_offset, src_length)
+        self.base.uniform3iv(location, v, src_offset, src_length)
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.8
@@ -2167,7 +2427,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         src_offset: u32,
         src_length: u32,
     ) {
-        self.base.Uniform4iv(location, v, src_offset, src_length)
+        self.base.uniform4iv(location, v, src_offset, src_length)
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.8
@@ -2216,7 +2476,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         src_offset: u32,
         src_length: u32,
     ) {
-        self.base.Uniform4fv(location, v, src_offset, src_length);
+        self.base.uniform4fv(location, v, src_offset, src_length);
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.10
@@ -2229,7 +2489,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         src_length: u32,
     ) {
         self.base
-            .UniformMatrix2fv(location, transpose, v, src_offset, src_length)
+            .uniform_matrix_2fv(location, transpose, v, src_offset, src_length)
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.10
@@ -2242,7 +2502,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         src_length: u32,
     ) {
         self.base
-            .UniformMatrix3fv(location, transpose, v, src_offset, src_length)
+            .uniform_matrix_3fv(location, transpose, v, src_offset, src_length)
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.10
@@ -2255,7 +2515,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         src_length: u32,
     ) {
         self.base
-            .UniformMatrix4fv(location, transpose, v, src_offset, src_length)
+            .uniform_matrix_4fv(location, transpose, v, src_offset, src_length)
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.8
@@ -2548,6 +2808,40 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         self.base.VertexAttrib4fv(indx, v)
     }
 
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.8
+    fn VertexAttribI4i(&self, index: u32, x: i32, y: i32, z: i32, w: i32) {
+        self.vertex_attrib_i(index, x, y, z, w)
+    }
+
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.8
+    fn VertexAttribI4iv(&self, index: u32, v: Int32ArrayOrLongSequence) {
+        let values = match v {
+            Int32ArrayOrLongSequence::Int32Array(v) => v.to_vec(),
+            Int32ArrayOrLongSequence::LongSequence(v) => v,
+        };
+        if values.len() < 4 {
+            return self.base.webgl_error(InvalidValue);
+        }
+        self.vertex_attrib_i(index, values[0], values[1], values[2], values[3]);
+    }
+
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.8
+    fn VertexAttribI4ui(&self, index: u32, x: u32, y: u32, z: u32, w: u32) {
+        self.vertex_attrib_u(index, x, y, z, w)
+    }
+
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.8
+    fn VertexAttribI4uiv(&self, index: u32, v: Uint32ArrayOrUnsignedLongSequence) {
+        let values = match v {
+            Uint32ArrayOrUnsignedLongSequence::Uint32Array(v) => v.to_vec(),
+            Uint32ArrayOrUnsignedLongSequence::UnsignedLongSequence(v) => v,
+        };
+        if values.len() < 4 {
+            return self.base.webgl_error(InvalidValue);
+        }
+        self.vertex_attrib_u(index, values[0], values[1], values[2], values[3]);
+    }
+
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.10
     fn VertexAttribPointer(
         &self,
@@ -2562,6 +2856,21 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
             .VertexAttribPointer(attrib_id, size, data_type, normalized, stride, offset)
     }
 
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.8
+    fn VertexAttribIPointer(&self, index: u32, size: i32, type_: u32, stride: i32, offset: i64) {
+        match type_ {
+            constants::BYTE |
+            constants::UNSIGNED_BYTE |
+            constants::SHORT |
+            constants::UNSIGNED_SHORT |
+            constants::INT |
+            constants::UNSIGNED_INT => {},
+            _ => return self.base.webgl_error(InvalidEnum),
+        };
+        self.base
+            .VertexAttribPointer(index, size, type_, false, stride, offset)
+    }
+
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.4
     fn Viewport(&self, x: i32, y: i32, width: i32, height: i32) {
         self.base.Viewport(x, y, width, height)
@@ -2572,7 +2881,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         &self,
         target: u32,
         level: i32,
-        internal_format: u32,
+        internal_format: i32,
         width: i32,
         height: i32,
         border: i32,
@@ -2598,7 +2907,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         &self,
         target: u32,
         level: i32,
-        internal_format: u32,
+        internal_format: i32,
         format: u32,
         data_type: u32,
         source: ImageDataOrHTMLImageElementOrHTMLCanvasElementOrHTMLVideoElement,
@@ -2607,28 +2916,164 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
             .TexImage2D_(target, level, internal_format, format, data_type, source)
     }
 
-    /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.8
-    fn TexImageDOM(
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.6
+    fn TexImage2D__(
         &self,
         target: u32,
         level: i32,
-        internal_format: u32,
+        internalformat: i32,
         width: i32,
         height: i32,
+        border: i32,
         format: u32,
-        data_type: u32,
-        source: &HTMLIFrameElement,
+        type_: u32,
+        source: ImageDataOrHTMLImageElementOrHTMLCanvasElementOrHTMLVideoElement,
     ) -> Fallible<()> {
-        self.base.TexImageDOM(
+        if self.bound_pixel_unpack_buffer.get().is_some() {
+            return Ok(self.base.webgl_error(InvalidOperation));
+        }
+
+        let validator = TexImage2DValidator::new(
+            &self.base,
             target,
             level,
-            internal_format,
+            internalformat as u32,
             width,
             height,
+            border,
+            format,
+            type_,
+        );
+
+        let TexImage2DValidatorResult {
+            texture,
+            target,
+            width: _,
+            height: _,
+            level,
+            border,
+            internal_format,
             format,
             data_type,
-            source,
-        )
+        } = match validator.validate() {
+            Ok(result) => result,
+            Err(_) => return Ok(()),
+        };
+
+        let unpacking_alignment = self.base.texture_unpacking_alignment();
+
+        let pixels = match self.base.get_image_pixels(source)? {
+            Some(pixels) => pixels,
+            None => return Ok(()),
+        };
+
+        self.base.tex_image_2d(
+            &texture,
+            target,
+            data_type,
+            internal_format,
+            format,
+            level,
+            border,
+            unpacking_alignment,
+            pixels,
+        );
+
+        Ok(())
+    }
+
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.6
+    #[allow(unsafe_code)]
+    fn TexImage2D___(
+        &self,
+        target: u32,
+        level: i32,
+        internalformat: i32,
+        width: i32,
+        height: i32,
+        border: i32,
+        format: u32,
+        type_: u32,
+        src_data: CustomAutoRooterGuard<ArrayBufferView>,
+        src_offset: u32,
+    ) -> Fallible<()> {
+        if self.bound_pixel_unpack_buffer.get().is_some() {
+            return Ok(self.base.webgl_error(InvalidOperation));
+        }
+
+        if type_ == constants::FLOAT_32_UNSIGNED_INT_24_8_REV {
+            return Ok(self.base.webgl_error(InvalidOperation));
+        }
+
+        let validator = TexImage2DValidator::new(
+            &self.base,
+            target,
+            level,
+            internalformat as u32,
+            width,
+            height,
+            border,
+            format,
+            type_,
+        );
+
+        let TexImage2DValidatorResult {
+            texture,
+            target,
+            width,
+            height,
+            level,
+            border,
+            internal_format,
+            format,
+            data_type,
+        } = match validator.validate() {
+            Ok(result) => result,
+            Err(_) => return Ok(()),
+        };
+
+        let unpacking_alignment = self.base.texture_unpacking_alignment();
+
+        let src_elem_size = typedarray_elem_size(src_data.get_array_type());
+        let src_byte_offset = src_offset as usize * src_elem_size;
+
+        if src_data.len() <= src_byte_offset {
+            return Ok(self.base.webgl_error(InvalidOperation));
+        }
+
+        let buff = IpcSharedMemory::from_bytes(unsafe { &src_data.as_slice()[src_byte_offset..] });
+
+        let expected_byte_length = match {
+            self.base.validate_tex_image_2d_data(
+                width,
+                height,
+                format,
+                data_type,
+                unpacking_alignment,
+                Some(&*src_data),
+            )
+        } {
+            Ok(byte_length) => byte_length,
+            Err(()) => return Ok(()),
+        };
+
+        if expected_byte_length as usize > buff.len() {
+            return Ok(self.base.webgl_error(InvalidOperation));
+        }
+
+        self.base.tex_image_2d(
+            &texture,
+            target,
+            data_type,
+            internal_format,
+            format,
+            level,
+            border,
+            unpacking_alignment,
+            TexPixels::from_array(buff, Size2D::new(width, height)),
+        );
+
+        Ok(())
     }
 
     /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.8
@@ -2776,6 +3221,8 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
 
     /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.9
     fn DrawArraysInstanced(&self, mode: u32, first: i32, count: i32, primcount: i32) {
+        self.validate_uniform_block_for_draw();
+        self.validate_vertex_attribs_for_draw();
         handle_potential_webgl_error!(
             self.base,
             self.base
@@ -2792,10 +3239,35 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         offset: i64,
         primcount: i32,
     ) {
+        self.validate_uniform_block_for_draw();
+        self.validate_vertex_attribs_for_draw();
         handle_potential_webgl_error!(
             self.base,
             self.base
                 .draw_elements_instanced(mode, count, type_, offset, primcount)
+        )
+    }
+
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.9
+    fn DrawRangeElements(
+        &self,
+        mode: u32,
+        start: u32,
+        end: u32,
+        count: i32,
+        type_: u32,
+        offset: i64,
+    ) {
+        if end < start {
+            self.base.webgl_error(InvalidValue);
+            return;
+        }
+        self.validate_uniform_block_for_draw();
+        self.validate_vertex_attribs_for_draw();
+        handle_potential_webgl_error!(
+            self.base,
+            self.base
+                .draw_elements_instanced(mode, count, type_, offset, 1)
         )
     }
 
@@ -2833,7 +3305,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
                 }
             }
 
-            query.delete(false);
+            query.delete(Operation::Infallible);
         }
     }
 
@@ -2859,7 +3331,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
                     slot.set(None);
                 }
             }
-            sampler.delete(false);
+            sampler.delete(Operation::Infallible);
         }
     }
 
@@ -3090,7 +3562,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
     fn DeleteSync(&self, sync: Option<&WebGLSync>) {
         if let Some(sync) = sync {
             handle_potential_webgl_error!(self.base, self.base.validate_ownership(sync), return);
-            sync.delete(false);
+            sync.delete(Operation::Infallible);
         }
     }
 
@@ -3169,7 +3641,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
                 self.base.webgl_error(InvalidOperation);
                 return;
             }
-            tf.delete(false);
+            tf.delete(Operation::Infallible);
             self.current_transform_feedback.set(None);
         }
     }
@@ -3256,7 +3728,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
                 return;
             },
         };
-        if !program.is_linked() || program.transform_feedback_varyings_length() != 0 {
+        if !program.is_linked() || program.transform_feedback_varyings_length() == 0 {
             self.base.webgl_error(InvalidOperation);
             return;
         };
@@ -3403,7 +3875,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
 
         for slot in &[&generic_slot, &indexed_binding.buffer] {
             if let Some(old) = slot.get() {
-                old.decrement_attached_counter();
+                old.decrement_attached_counter(Operation::Infallible);
             }
             slot.set(buffer);
         }
@@ -3481,7 +3953,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
 
         for slot in &[&generic_slot, &indexed_binding.buffer] {
             if let Some(old) = slot.get() {
-                old.decrement_attached_counter();
+                old.decrement_attached_counter(Operation::Infallible);
             }
             slot.set(buffer);
         }
@@ -3745,7 +4217,7 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
         }
 
         if width < 0 || height < 0 {
-            return;
+            return self.base.webgl_error(InvalidValue);
         }
 
         self.base
@@ -3882,11 +4354,36 @@ impl WebGL2RenderingContextMethods for WebGL2RenderingContext {
             self.base.send_command(WebGLCommand::DrawBuffers(buffers));
         }
     }
+
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.6
+    fn TexStorage2D(
+        &self,
+        target: u32,
+        levels: i32,
+        internal_format: u32,
+        width: i32,
+        height: i32,
+    ) {
+        self.tex_storage(2, target, levels, internal_format, width, height, 1)
+    }
+
+    /// https://www.khronos.org/registry/webgl/specs/latest/2.0/#3.7.6
+    fn TexStorage3D(
+        &self,
+        target: u32,
+        levels: i32,
+        internal_format: u32,
+        width: i32,
+        height: i32,
+        depth: i32,
+    ) {
+        self.tex_storage(3, target, levels, internal_format, width, height, depth)
+    }
 }
 
-impl LayoutCanvasWebGLRenderingContextHelpers for LayoutDom<WebGL2RenderingContext> {
+impl LayoutCanvasWebGLRenderingContextHelpers for LayoutDom<'_, WebGL2RenderingContext> {
     #[allow(unsafe_code)]
-    unsafe fn canvas_data_source(&self) -> HTMLCanvasDataSource {
+    unsafe fn canvas_data_source(self) -> HTMLCanvasDataSource {
         let this = &*self.unsafe_get();
         (*this.base.to_layout().unsafe_get()).layout_handle()
     }

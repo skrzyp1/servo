@@ -26,7 +26,6 @@ use crate::dom::node::{Node, NodeDamage};
 use crate::dom::offscreencanvas::{OffscreenCanvas, OffscreenCanvasContext};
 use crate::dom::paintworkletglobalscope::PaintWorkletGlobalScope;
 use crate::dom::textmetrics::TextMetrics;
-use crate::euclidext::Size2DExt;
 use crate::unpremultiplytable::UNPREMULTIPLY_TABLE;
 use canvas_traits::canvas::{Canvas2dMsg, CanvasId, CanvasMsg};
 use canvas_traits::canvas::{CompositionOrBlending, FillOrStrokeStyle, FillRule};
@@ -39,12 +38,7 @@ use euclid::{
     vec2,
 };
 use ipc_channel::ipc::{self, IpcSender};
-use net_traits::image_cache::CanRequestImages;
-use net_traits::image_cache::ImageCache;
-use net_traits::image_cache::ImageOrMetadataAvailable;
-use net_traits::image_cache::ImageResponse;
-use net_traits::image_cache::ImageState;
-use net_traits::image_cache::UsePlaceholder;
+use net_traits::image_cache::{ImageCache, ImageResponse};
 use net_traits::request::CorsSettings;
 use pixels::PixelFormat;
 use profile_traits::ipc as profiled_ipc;
@@ -176,14 +170,6 @@ impl CanvasState {
         &self.missing_image_urls
     }
 
-    pub fn get_state(&self) -> &DomRefCell<CanvasContextState> {
-        &self.state
-    }
-
-    pub fn get_saved_state(&self) -> &DomRefCell<Vec<CanvasContextState>> {
-        &self.saved_states
-    }
-
     pub fn get_canvas_id(&self) -> CanvasId {
         self.canvas_id.clone()
     }
@@ -270,19 +256,12 @@ impl CanvasState {
         url: ServoUrl,
         cors_setting: Option<CorsSettings>,
     ) -> ImageResponse {
-        let response = self.image_cache.find_image_or_metadata(
-            url.clone(),
-            self.origin.clone(),
-            cors_setting,
-            UsePlaceholder::No,
-            CanRequestImages::No,
-        );
-        match response {
-            Ok(ImageOrMetadataAvailable::ImageAvailable(image, url)) => {
-                ImageResponse::Loaded(image, url)
-            },
-            Err(ImageState::Pending(_)) => ImageResponse::None,
-            _ => {
+        match self
+            .image_cache
+            .get_image(url.clone(), self.origin.clone(), cors_setting)
+        {
+            Some(image) => ImageResponse::Loaded(image, url),
+            None => {
                 // Rather annoyingly, we get the same response back from
                 // A load which really failed and from a load which hasn't started yet.
                 self.missing_image_urls.borrow_mut().push(url);

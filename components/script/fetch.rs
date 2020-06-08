@@ -36,14 +36,12 @@ use net_traits::{FetchChannels, FetchResponseListener, NetworkError};
 use net_traits::{FetchMetadata, FilteredMetadata, Metadata};
 use net_traits::{ResourceFetchTiming, ResourceTimingType};
 use servo_url::ServoUrl;
-use std::mem;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 struct FetchContext {
     fetch_promise: Option<TrustedPromise>,
     response_object: Trusted<Response>,
-    body: Vec<u8>,
     resource_timing: ResourceFetchTiming,
 }
 
@@ -128,6 +126,7 @@ fn request_init_from_request(request: NetTraitsRequest) -> RequestBuilder {
         parser_metadata: request.parser_metadata,
         initiator: request.initiator,
         csp_list: None,
+        https_state: request.https_state,
     }
 }
 
@@ -148,6 +147,7 @@ pub fn Fetch(
     // Step 2
     let request = match Request::Constructor(global, input, init) {
         Err(e) => {
+            response.error_stream(e.clone());
             promise.reject_error(e);
             return promise;
         },
@@ -171,7 +171,6 @@ pub fn Fetch(
     let fetch_context = Arc::new(Mutex::new(FetchContext {
         fetch_promise: Some(TrustedPromise::new(promise.clone())),
         response_object: Trusted::new(&*response),
-        body: vec![],
         resource_timing: ResourceFetchTiming::new(timing_type),
     }));
     let listener = NetworkListener {
@@ -221,7 +220,9 @@ impl FetchResponseListener for FetchContext {
             Err(_) => {
                 promise.reject_error(Error::Type("Network error occurred".to_string()));
                 self.fetch_promise = Some(TrustedPromise::new(promise));
-                self.response_object.root().set_type(DOMResponseType::Error);
+                let response = self.response_object.root();
+                response.set_type(DOMResponseType::Error);
+                response.error_stream(Error::Type("Network error occurred".to_string()));
                 return;
             },
             // Step 4.2
@@ -246,10 +247,10 @@ impl FetchResponseListener for FetchContext {
                             .root()
                             .set_type(DOMResponseType::Opaque);
                     },
-                    FilteredMetadata::OpaqueRedirect => {
-                        self.response_object
-                            .root()
-                            .set_type(DOMResponseType::Opaqueredirect);
+                    FilteredMetadata::OpaqueRedirect(url) => {
+                        let r = self.response_object.root();
+                        r.set_type(DOMResponseType::Opaqueredirect);
+                        r.set_final_url(url);
                     },
                 },
             },
@@ -259,15 +260,15 @@ impl FetchResponseListener for FetchContext {
         self.fetch_promise = Some(TrustedPromise::new(promise));
     }
 
-    fn process_response_chunk(&mut self, mut chunk: Vec<u8>) {
-        self.response_object.root().stream_chunk(chunk.as_slice());
-        self.body.append(&mut chunk);
+    fn process_response_chunk(&mut self, chunk: Vec<u8>) {
+        let response = self.response_object.root();
+        response.stream_chunk(chunk);
     }
 
     fn process_response_eof(&mut self, _response: Result<ResourceFetchTiming, NetworkError>) {
         let response = self.response_object.root();
         let _ac = enter_realm(&*response);
-        response.finish(mem::replace(&mut self.body, vec![]));
+        response.finish();
         // TODO
         // ... trailerObject is not supported in Servo yet.
     }
@@ -306,6 +307,7 @@ fn fill_headers_with_metadata(r: DomRoot<Response>, m: Metadata) {
     r.set_headers(m.headers);
     r.set_raw_status(m.status);
     r.set_final_url(m.final_url);
+    r.set_redirected(m.redirected);
 }
 
 /// Convenience function for synchronously loading a whole resource.
@@ -314,6 +316,7 @@ pub fn load_whole_resource(
     core_resource_thread: &CoreResourceThread,
     global: &GlobalScope,
 ) -> Result<(Metadata, Vec<u8>), NetworkError> {
+    let request = request.https_state(global.get_https_state());
     let (action_sender, action_receiver) = ipc::channel().unwrap();
     let url = request.url.clone();
     core_resource_thread
